@@ -183,9 +183,11 @@ func NewServiceProxySQL(cr *api.PerconaXtraDBCluster) *corev1.Service {
 	}
 	serviceAnnotations := make(map[string]string)
 	loadBalancerSourceRanges := []string{}
+	loadBalancerIP := ""
 	if cr.Spec.ProxySQL != nil {
 		serviceAnnotations = cr.Spec.ProxySQL.ServiceAnnotations
 		loadBalancerSourceRanges = cr.Spec.ProxySQL.LoadBalancerSourceRanges
+		loadBalancerIP = cr.Spec.ProxySQL.LoadBalancerIP
 	}
 	obj := &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
@@ -225,6 +227,10 @@ func NewServiceProxySQL(cr *api.PerconaXtraDBCluster) *corev1.Service {
 		}
 
 		obj.Spec.ExternalTrafficPolicy = svcTrafficPolicyType
+	}
+
+	if svcType == corev1.ServiceTypeLoadBalancer {
+		obj.Spec.LoadBalancerIP = loadBalancerIP
 	}
 
 	if cr.CompareVersionWith("1.6.0") >= 0 {
