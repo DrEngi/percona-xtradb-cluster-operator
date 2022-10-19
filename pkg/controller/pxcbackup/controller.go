@@ -366,6 +366,13 @@ func (r *ReconcilePerconaXtraDBClusterBackup) runS3BackupFinalizer(cr *api.Perco
 
 func removeBackup(bucket, backup string, s3cli *minio.Client) func() error {
 	return func() error {
+		//if the bucket contains a path, we need to remove it from the bucket name and add it to the backup name
+		spl := strings.Split(bucket, "/")
+		if len(spl) > 1 {
+			bucket = spl[0]
+			backup = strings.Join(spl[1:], "/") + "/" + backup
+		}
+
 		objs := s3cli.ListObjects(context.Background(), bucket,
 			minio.ListObjectsOptions{
 				Recursive: true,
