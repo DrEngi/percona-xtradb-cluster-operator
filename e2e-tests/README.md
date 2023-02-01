@@ -11,7 +11,7 @@ Run the following commands to install the required components:
 ```
 sudo yum -y install epel-release https://repo.percona.com/yum/percona-release-latest.noarch.rpm
 sudo yum -y install coreutils sed jq curl docker percona-xtrabackup-24
-sudo curl -s -L https://github.com/mikefarah/yq/releases/download/3.4.1/yq_linux_amd64 -o /usr/bin/yq
+sudo curl -s -L https://github.com/mikefarah/yq/releases/download/4.27.2/yq_linux_amd64 -o /usr/bin/yq
 sudo chmod a+x /usr/bin/yq
 curl -s -L https://github.com/openshift/origin/releases/download/v3.11.0/openshift-origin-client-tools-v3.11.0-0cbc58b-linux-64bit.tar.gz \
     | tar -C /usr/bin --strip-components 1 --wildcards -zxvpf - '*/oc' '*/kubectl'
@@ -25,9 +25,7 @@ curl https://sdk.cloud.google.com | bash
 Install [Docker](https://docs.docker.com/docker-for-mac/install/), and run the following commands for the other required components:
 
 ```
-brew install coreutils gnu-sed jq kubernetes-cli openshift-cli kubernetes-helm percona-xtrabackup
-brew install yq@3
-brew link yq@3
+brew install coreutils gnu-sed jq yq kubernetes-cli openshift-cli kubernetes-helm percona-xtrabackup
 curl https://sdk.cloud.google.com | bash
 ```
 
@@ -44,10 +42,15 @@ needs some repository for the newly created docker images. If nothing is
 specified, scripts use Percona's experimental repository `perconalab/percona-xtradb-cluster-operator`, which
 requires decent access rights to make a push.
 
-To specify your own repository for the Percona XtraDB Cluster Operator docker image, you can use IMAGE environment variable:
+To specify your own repository for the Operator docker image, you can use IMAGE environment variable:
 
 ```
 export IMAGE=bob/my_repository_for_test_images:K8SPXC-622-fix-feature-X
+```
+We use linux/amd64 platform by default. To specify another platform, you can use DOCKER_DEFAULT_PLATFORM environment variable
+
+```
+export DOCKER_DEFAULT_PLATFORM=linux/amd64
 ```
 
 Use the following script to build the image:
@@ -94,7 +97,7 @@ Tests can also be run one-by-one using the appropriate scripts (their names shou
 You can use environment variables to re-declare all default docker images used for testing. The
 full list of variables is the following one:
 
-* `IMAGE` - Percona XtraDB Cluster Operator, `perconalab/percona-xtradb-cluster-operator:main` by default,
+* `IMAGE` - the Operator, `perconalab/percona-xtradb-cluster-operator:main` by default,
 * `IMAGE_PXC` - Percona XtraDB Cluster, `perconalab/percona-xtradb-cluster-operator:main-pxc8.0` by default,
 * `IMAGE_PMM` - Percona Monitoring and Management (PMM) client, `perconalab/pmm-client:dev-latest` by default,
 * `IMAGE_PROXY` - ProxySQL, `perconalab/percona-xtradb-cluster-operator:main-proxysql` by default,
@@ -127,7 +130,7 @@ export CLEAN_NAMESPACE=1
 Making backups [on S3-compatible storage](https://www.percona.com/doc/kubernetes-operator-for-pxc/backups.html#making-scheduled-backups) needs creating Secrets to have the access to the S3 buckets. There is an environment variable enabled by default, which skips all tests requiring such Secrets:
 
 ```
-SKIP_BACKUPS_TO_AWS_GCP=1
+SKIP_REMOTE_BACKUPS=1
 ```
 
 The backups tests will use only [MinIO](https://min.io/) if this variable is declared,

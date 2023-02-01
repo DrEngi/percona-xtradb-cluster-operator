@@ -93,6 +93,7 @@ func (c *HAProxy) AppContainer(spec *api.PodSpec, secrets string, cr *api.Percon
 			},
 		},
 		SecurityContext: spec.ContainerSecurityContext,
+		Resources:       spec.Resources,
 	}
 
 	if cr.CompareVersionWith("1.7.0") < 0 {
@@ -187,6 +188,12 @@ func (c *HAProxy) AppContainer(spec *api.PodSpec, secrets string, cr *api.Percon
 		}
 		appc.Env = append(appc.Env, probsEnvs...)
 	}
+	if cr.CompareVersionWith("1.11.0") >= 0 && cr.Spec.HAProxy != nil && cr.Spec.HAProxy.HookScript != "" {
+		appc.VolumeMounts = append(appc.VolumeMounts, corev1.VolumeMount{
+			Name:      "hookscript",
+			MountPath: "/opt/percona/hookscript",
+		})
+	}
 	hasKey, err := cr.ConfigHasKey("mysqld", "proxy_protocol_networks")
 	if err != nil {
 		return appc, errors.Wrap(err, "check if congfig has proxy_protocol_networks key")
@@ -198,21 +205,10 @@ func (c *HAProxy) AppContainer(spec *api.PodSpec, secrets string, cr *api.Percon
 		})
 	}
 
-	res, err := app.CreateResources(spec.Resources)
-	if err != nil {
-		return appc, fmt.Errorf("create resources error: %v", err)
-	}
-	appc.Resources = res
-
 	return appc, nil
 }
 
 func (c *HAProxy) SidecarContainers(spec *api.PodSpec, secrets string, cr *api.PerconaXtraDBCluster) ([]corev1.Container, error) {
-	res, err := app.CreateResources(spec.SidecarResources)
-	if err != nil {
-		return nil, fmt.Errorf("create sidecar resources error: %v", err)
-	}
-
 	container := corev1.Container{
 		Name:            "pxc-monit",
 		Image:           spec.Image,
@@ -228,7 +224,7 @@ func (c *HAProxy) SidecarContainers(spec *api.PodSpec, secrets string, cr *api.P
 				Value: c.labels["app.kubernetes.io/instance"] + "-" + "pxc",
 			},
 		},
-		Resources: res,
+		Resources: spec.SidecarResources,
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "haproxy-custom",
@@ -283,19 +279,20 @@ func (c *HAProxy) SidecarContainers(spec *api.PodSpec, secrets string, cr *api.P
 			MountPath: "/etc/mysql/haproxy-env-secret",
 		})
 	}
+
 	return []corev1.Container{container}, nil
 }
 
-func (c *HAProxy) LogCollectorContainer(spec *api.LogCollectorSpec, logPsecrets string, logRsecrets string, cr *api.PerconaXtraDBCluster) ([]corev1.Container, error) {
+func (c *HAProxy) LogCollectorContainer(_ *api.LogCollectorSpec, _ string, _ string, _ *api.PerconaXtraDBCluster) ([]corev1.Container, error) {
 	return nil, nil
 }
 
-func (c *HAProxy) PMMContainer(spec *api.PMMSpec, secrets string, cr *api.PerconaXtraDBCluster) (*corev1.Container, error) {
+func (c *HAProxy) PMMContainer(spec *api.PMMSpec, secret *corev1.Secret, cr *api.PerconaXtraDBCluster) (*corev1.Container, error) {
 	if cr.CompareVersionWith("1.9.0") < 0 {
 		return nil, nil
 	}
 
-	ct := app.PMMClient(spec, secrets, cr.CompareVersionWith("1.2.0") >= 0, cr.CompareVersionWith("1.7.0") >= 0)
+	ct := app.PMMClient(spec, secret, cr.CompareVersionWith("1.2.0") >= 0, cr.CompareVersionWith("1.7.0") >= 0)
 
 	pmmEnvs := []corev1.EnvVar{
 		{
@@ -309,7 +306,7 @@ func (c *HAProxy) PMMContainer(spec *api.PMMSpec, secrets string, cr *api.Percon
 		{
 			Name: "MONITOR_PASSWORD",
 			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: app.SecretKeySelector(secrets, "monitor"),
+				SecretKeyRef: app.SecretKeySelector(secret.Name, "monitor"),
 			},
 		},
 		{
@@ -319,7 +316,7 @@ func (c *HAProxy) PMMContainer(spec *api.PMMSpec, secrets string, cr *api.Percon
 		{
 			Name: "DB_PASSWORD",
 			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: app.SecretKeySelector(secrets, "monitor"),
+				SecretKeyRef: app.SecretKeySelector(secret.Name, "monitor"),
 			},
 		},
 		{
@@ -348,11 +345,24 @@ func (c *HAProxy) PMMContainer(spec *api.PMMSpec, secrets string, cr *api.Percon
 	pmmAgentScriptEnv := app.PMMAgentScript("haproxy")
 	ct.Env = append(ct.Env, pmmAgentScriptEnv...)
 
-	res, err := app.CreateResources(spec.Resources)
-	if err != nil {
-		return nil, fmt.Errorf("create resources error: %v", err)
+	if cr.CompareVersionWith("1.10.0") >= 0 {
+		// PMM team added these flags which allows us to avoid
+		// container crash, but just restart pmm-agent till it recovers
+		// the connection.
+		sidecarEnvs := []corev1.EnvVar{
+			{
+				Name:  "PMM_AGENT_SIDECAR",
+				Value: "true",
+			},
+			{
+				Name:  "PMM_AGENT_SIDECAR_SLEEP",
+				Value: "5",
+			},
+		}
+		ct.Env = append(ct.Env, sidecarEnvs...)
 	}
-	ct.Resources = res
+
+	ct.Resources = spec.Resources
 
 	return &ct, nil
 }
@@ -374,7 +384,10 @@ func (c *HAProxy) Volumes(podSpec *api.PodSpec, cr *api.PerconaXtraDBCluster, vg
 	if cr.CompareVersionWith("1.9.0") >= 0 {
 		vol.Volumes = append(vol.Volumes, app.GetSecretVolumes(cr.Spec.HAProxy.EnvVarsSecretName, cr.Spec.HAProxy.EnvVarsSecretName, true))
 	}
-
+	if cr.CompareVersionWith("1.11.0") >= 0 && cr.Spec.HAProxy != nil && cr.Spec.HAProxy.HookScript != "" {
+		vol.Volumes = append(vol.Volumes,
+			app.GetConfigVolumes("hookscript", c.labels["app.kubernetes.io/instance"]+"-"+c.labels["app.kubernetes.io/component"]+"-hookscript"))
+	}
 	return vol, nil
 }
 

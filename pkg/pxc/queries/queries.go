@@ -8,7 +8,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -22,12 +22,26 @@ const (
 	ReplicationStatusNotInitiated
 )
 
+const (
+	WriterHostgroup = "writer_hostgroup"
+	ReaderHostgroup = "reader_hostgroup"
+)
+
 // value of writer group is hardcoded in ProxySQL config inside docker image
 // https://github.com/percona/percona-docker/blob/pxc-operator-1.3.0/proxysql/dockerdir/etc/proxysql-admin.cnf#L23
 const writerID = 11
 
 type Database struct {
 	db *sql.DB
+}
+
+type ReplicationConfig struct {
+	Source             ReplicationChannelSource
+	SourceRetryCount   uint
+	SourceConnectRetry uint
+	SSL                bool
+	SSLSkipVerify      bool
+	CA                 string
 }
 
 type ReplicationChannelSource struct {
@@ -39,7 +53,7 @@ type ReplicationChannelSource struct {
 
 var ErrNotFound = errors.New("not found")
 
-func New(client client.Client, namespace, secretName, user, host string, port int32) (Database, error) {
+func New(client client.Client, namespace, secretName, user, host string, port int32, timeout int32) (Database, error) {
 	secretObj := corev1.Secret{}
 	err := client.Get(context.TODO(),
 		types.NamespacedName{
@@ -52,9 +66,22 @@ func New(client client.Client, namespace, secretName, user, host string, port in
 		return Database{}, err
 	}
 
-	pass := string(secretObj.Data[user])
-	connStr := fmt.Sprintf("%s:%s@tcp(%s:%d)/mysql?interpolateParams=true", user, pass, host, port)
-	db, err := sql.Open("mysql", connStr)
+	timeoutStr := fmt.Sprintf("%ds", timeout)
+	config := mysql.NewConfig()
+	config.User = user
+	config.Passwd = string(secretObj.Data[user])
+	config.Net = "tcp"
+	config.DBName = "mysql"
+	config.Addr = fmt.Sprintf("%s:%d", host, port)
+	config.Params = map[string]string{
+		"interpolateParams": "true",
+		"timeout":           timeoutStr,
+		"readTimeout":       timeoutStr,
+		"writeTimeout":      timeoutStr,
+		"tls":               "preferred",
+	}
+
+	db, err := sql.Open("mysql", config.FormatDSN())
 	if err != nil {
 		return Database{}, err
 	}
@@ -90,6 +117,38 @@ func (p *Database) CurrentReplicationChannels() ([]string, error) {
 		result = append(result, src)
 	}
 	return result, nil
+}
+
+func (p *Database) ChangeChannelPassword(channel, password string) error {
+	tx, err := p.db.Begin()
+	if err != nil {
+		return errors.Wrap(err, "start transaction for updating channel password")
+	}
+	_, err = tx.Exec(`STOP REPLICA IO_THREAD FOR CHANNEL ?`, channel)
+	if err != nil {
+		errT := tx.Rollback()
+		if errT != nil {
+			return errors.Wrapf(err, "rollback STOP REPLICA IO_THREAD FOR CHANNEL %s", channel)
+		}
+		return errors.Wrapf(err, "stop replication IO thread for channel %s", channel)
+	}
+	_, err = tx.Exec(`CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD=? FOR CHANNEL ?`, password, channel)
+	if err != nil {
+		errT := tx.Rollback()
+		if errT != nil {
+			return errors.Wrapf(err, "rollback CHANGE SOURCE_PASSWORD FOR CHANNEL %s", channel)
+		}
+		return errors.Wrapf(err, "change master password for channel %s", channel)
+	}
+	_, err = tx.Exec(`START REPLICA IO_THREAD FOR CHANNEL ?`, channel)
+	if err != nil {
+		errT := tx.Rollback()
+		if errT != nil {
+			return errors.Wrapf(err, "rollback START REPLICA IO_THREAD FOR CHANNEL %s", channel)
+		}
+		return errors.Wrapf(err, "start io thread for channel %s", channel)
+	}
+	return tx.Commit()
 }
 
 func (p *Database) ReplicationStatus(channel string) (ReplicationStatus, error) {
@@ -190,25 +249,40 @@ func (p *Database) IsReadonly() (bool, error) {
 	return readonly == 1, errors.Wrap(err, "select global read_only param")
 }
 
-func (p *Database) StartReplication(replicaPass string, src ReplicationChannelSource) error {
-	_, err := p.db.Exec(`
-	CHANGE REPLICATION SOURCE TO
-    master_user='replication',
-    master_password=?,
-    master_host=?,
-	master_port=?,
-    source_connection_auto_failover=1,
-	master_auto_position=1,
-    master_retry_count=3,
-    master_connect_retry=60  
-    FOR CHANNEL ?
-`, replicaPass, src.Host, src.Port, src.Name)
-	if err != nil {
-		return errors.Wrap(err, "change source for channel "+src.Name)
+func (p *Database) StartReplication(replicaPass string, config ReplicationConfig) error {
+	var ca string
+	var ssl int
+	if config.SSL {
+		ssl = 1
+		ca = config.CA
 	}
 
-	_, err = p.db.Exec(`START REPLICA FOR CHANNEL ?`, src.Name)
-	return errors.Wrap(err, "start replica for source "+src.Name)
+	var sslVerify int
+	if !config.SSLSkipVerify {
+		sslVerify = 1
+	}
+
+	_, err := p.db.Exec(`
+	CHANGE REPLICATION SOURCE TO
+		SOURCE_USER='replication',
+		SOURCE_PASSWORD=?,
+		SOURCE_HOST=?,
+		SOURCE_PORT=?,
+		SOURCE_CONNECTION_AUTO_FAILOVER=1,
+		SOURCE_AUTO_POSITION=1,
+		SOURCE_RETRY_COUNT=?,
+		SOURCE_CONNECT_RETRY=?,
+		SOURCE_SSL=?,
+		SOURCE_SSL_CA=?,
+		SOURCE_SSL_VERIFY_SERVER_CERT=?
+		FOR CHANNEL ?
+`, replicaPass, config.Source.Host, config.Source.Port, config.SourceRetryCount, config.SourceConnectRetry, ssl, ca, sslVerify, config.Source.Name)
+	if err != nil {
+		return errors.Wrapf(err, "change source for channel %s", config.Source.Name)
+	}
+
+	_, err = p.db.Exec(`START REPLICA FOR CHANNEL ?`, config.Source.Name)
+	return errors.Wrapf(err, "start replica for source %s", config.Source.Name)
 
 }
 
@@ -217,8 +291,8 @@ func (p *Database) DeleteReplicationSource(name, host string, port int) error {
 	return errors.Wrap(err, "delete replication source "+name)
 }
 
-func (p *Database) Status(host, ip string) ([]string, error) {
-	rows, err := p.db.Query("SELECT status FROM mysql_servers WHERE hostname LIKE ? OR hostname = ?;", host+"%", ip)
+func (p *Database) ProxySQLInstanceStatus(host string) ([]string, error) {
+	rows, err := p.db.Query("SELECT status FROM mysql_servers WHERE hostname LIKE ?;", host+"%")
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -239,6 +313,25 @@ func (p *Database) Status(host, ip string) ([]string, error) {
 	}
 
 	return statuses, nil
+}
+
+func (p *Database) PresentInHostgroups(host string) (bool, error) {
+	hostgroups := []string{WriterHostgroup, ReaderHostgroup}
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM mysql_servers
+		INNER JOIN mysql_galera_hostgroups ON hostgroup_id IN (%s)
+		WHERE hostname LIKE ? GROUP BY hostname`, strings.Join(hostgroups, ","))
+	var count int
+	err := p.db.QueryRow(query, host+"%").Scan(&count)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrNotFound
+		}
+		return false, err
+	}
+	if count != len(hostgroups) {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (p *Database) PrimaryHost() (string, error) {

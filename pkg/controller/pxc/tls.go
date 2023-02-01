@@ -7,9 +7,8 @@ import (
 
 	"github.com/pkg/errors"
 
-	cmmeta "github.com/jetstack/cert-manager/pkg/apis/meta/v1"
-
-	cm "github.com/jetstack/cert-manager/pkg/apis/certmanager/v1alpha2"
+	cm "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	api "github.com/percona/percona-xtradb-cluster-operator/pkg/apis/pxc/v1"
 	"github.com/percona/percona-xtradb-cluster-operator/pkg/pxctls"
 	corev1 "k8s.io/api/core/v1"
@@ -18,25 +17,38 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-func (r *ReconcilePerconaXtraDBCluster) reconsileSSL(cr *api.PerconaXtraDBCluster) error {
+func (r *ReconcilePerconaXtraDBCluster) reconcileSSL(cr *api.PerconaXtraDBCluster) error {
 	if cr.Spec.AllowUnsafeConfig && (cr.Spec.TLS == nil || cr.Spec.TLS.IssuerConf == nil) {
 		return nil
 	}
 	secretObj := corev1.Secret{}
-	err := r.client.Get(context.TODO(),
+	secretInternalObj := corev1.Secret{}
+	errSecret := r.client.Get(context.TODO(),
 		types.NamespacedName{
 			Namespace: cr.Namespace,
 			Name:      cr.Spec.PXC.SSLSecretName,
 		},
 		&secretObj,
 	)
-	if err == nil {
+	errInternalSecret := r.client.Get(context.TODO(),
+		types.NamespacedName{
+			Namespace: cr.Namespace,
+			Name:      cr.Spec.PXC.SSLInternalSecretName,
+		},
+		&secretInternalObj,
+	)
+	if errSecret == nil && errInternalSecret == nil {
 		return nil
-	} else if !k8serr.IsNotFound(err) {
-		return fmt.Errorf("get secret: %v", err)
+	} else if errSecret != nil && !k8serr.IsNotFound(errSecret) {
+		return fmt.Errorf("get secret: %v", errSecret)
+	} else if errInternalSecret != nil && !k8serr.IsNotFound(errInternalSecret) {
+		return fmt.Errorf("get internal secret: %v", errInternalSecret)
 	}
-
-	err = r.createSSLByCertManager(cr)
+	// don't create secret ssl-internal if secret ssl is not created by operator
+	if errSecret == nil && !metav1.IsControlledBy(&secretObj, cr) {
+		return nil
+	}
+	err := r.createSSLByCertManager(cr)
 	if err != nil {
 		if cr.Spec.TLS != nil && cr.Spec.TLS.IssuerConf != nil {
 			return fmt.Errorf("create ssl with cert manager %w", err)
@@ -50,12 +62,6 @@ func (r *ReconcilePerconaXtraDBCluster) reconsileSSL(cr *api.PerconaXtraDBCluste
 }
 
 func (r *ReconcilePerconaXtraDBCluster) createSSLByCertManager(cr *api.PerconaXtraDBCluster) error {
-	owner, err := OwnerRef(cr, r.scheme)
-	if err != nil {
-		return err
-	}
-	ownerReferences := []metav1.OwnerReference{owner}
-
 	issuerName := cr.Name + "-pxc-issuer"
 	caIssuerName := cr.Name + "-pxc-ca-issuer"
 	issuerKind := "Issuer"
@@ -65,15 +71,14 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLByCertManager(cr *api.PerconaXt
 		issuerName = cr.Spec.TLS.IssuerConf.Name
 		issuerGroup = cr.Spec.TLS.IssuerConf.Group
 	} else {
-		if err := r.createIssuer(ownerReferences, cr.Namespace, caIssuerName, ""); err != nil {
+		if err := r.createIssuer(cr.Namespace, caIssuerName, ""); err != nil {
 			return err
 		}
 
 		caCert := &cm.Certificate{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:            cr.Name + "-ca-cert",
-				Namespace:       cr.Namespace,
-				OwnerReferences: ownerReferences,
+				Name:      cr.Name + "-ca-cert",
+				Namespace: cr.Namespace,
 			},
 			Spec: cm.CertificateSpec{
 				SecretName: cr.Name + "-ca-cert",
@@ -84,12 +89,12 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLByCertManager(cr *api.PerconaXt
 					Kind:  issuerKind,
 					Group: issuerGroup,
 				},
-				Duration:    &metav1.Duration{Duration: 87600 * time.Hour},
+				Duration:    &metav1.Duration{Duration: time.Hour * 24 * 365},
 				RenewBefore: &metav1.Duration{Duration: 730 * time.Hour},
 			},
 		}
 
-		err = r.client.Create(context.TODO(), caCert)
+		err := r.client.Create(context.TODO(), caCert)
 		if err != nil && !k8serr.IsAlreadyExists(err) {
 			return fmt.Errorf("create CA certificate: %v", err)
 		}
@@ -98,22 +103,22 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLByCertManager(cr *api.PerconaXt
 			return err
 		}
 
-		if err := r.createIssuer(ownerReferences, cr.Namespace, issuerName, caCert.Spec.SecretName); err != nil {
+		if err := r.createIssuer(cr.Namespace, issuerName, caCert.Spec.SecretName); err != nil {
 			return err
 		}
 	}
 
 	kubeCert := &cm.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            cr.Name + "-ssl",
-			Namespace:       cr.Namespace,
-			OwnerReferences: ownerReferences,
+			Name:      cr.Name + "-ssl",
+			Namespace: cr.Namespace,
 		},
 		Spec: cm.CertificateSpec{
 			SecretName: cr.Spec.PXC.SSLSecretName,
 			CommonName: cr.Name + "-proxysql",
 			DNSNames: []string{
 				cr.Name + "-pxc",
+				cr.Name + "-proxysql",
 				"*." + cr.Name + "-pxc",
 				"*." + cr.Name + "-proxysql",
 			},
@@ -130,7 +135,7 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLByCertManager(cr *api.PerconaXt
 		kubeCert.Spec.DNSNames = append(kubeCert.Spec.DNSNames, cr.Spec.TLS.SANs...)
 	}
 
-	err = r.client.Create(context.TODO(), kubeCert)
+	err := r.client.Create(context.TODO(), kubeCert)
 	if err != nil && !k8serr.IsAlreadyExists(err) {
 		return fmt.Errorf("create certificate: %v", err)
 	}
@@ -141,15 +146,21 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLByCertManager(cr *api.PerconaXt
 
 	kubeCert = &cm.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            cr.Name + "-ssl-internal",
-			Namespace:       cr.Namespace,
-			OwnerReferences: ownerReferences,
+			Name:      cr.Name + "-ssl-internal",
+			Namespace: cr.Namespace,
 		},
 		Spec: cm.CertificateSpec{
 			SecretName: cr.Spec.PXC.SSLInternalSecretName,
 			CommonName: cr.Name + "-pxc",
 			DNSNames: []string{
+				cr.Name + "-pxc",
 				"*." + cr.Name + "-pxc",
+				cr.Name + "-haproxy-replicas." + cr.Namespace + ".svc.cluster.local",
+				cr.Name + "-haproxy-replicas." + cr.Namespace,
+				cr.Name + "-haproxy-replicas",
+				cr.Name + "-haproxy." + cr.Namespace + ".svc.cluster.local",
+				cr.Name + "-haproxy." + cr.Namespace,
+				cr.Name + "-haproxy",
 			},
 			IsCA: true,
 			IssuerRef: cmmeta.ObjectReference{
@@ -200,8 +211,7 @@ func (r *ReconcilePerconaXtraDBCluster) waitForCerts(namespace string, secretsLi
 	}
 }
 
-func (r *ReconcilePerconaXtraDBCluster) createIssuer(ownRef []metav1.OwnerReference, namespace, issuer string, caCertSecret string) error {
-
+func (r *ReconcilePerconaXtraDBCluster) createIssuer(namespace, issuer string, caCertSecret string) error {
 	spec := cm.IssuerSpec{}
 
 	if caCertSecret == "" {
@@ -220,9 +230,8 @@ func (r *ReconcilePerconaXtraDBCluster) createIssuer(ownRef []metav1.OwnerRefere
 
 	err := r.client.Create(context.TODO(), &cm.Issuer{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            issuer,
-			Namespace:       namespace,
-			OwnerReferences: ownRef,
+			Name:      issuer,
+			Namespace: namespace,
 		},
 		Spec: spec,
 	})
@@ -265,12 +274,18 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLManualy(cr *api.PerconaXtraDBCl
 		Type: corev1.SecretTypeTLS,
 	}
 	err = r.client.Create(context.TODO(), &secretObj)
-	if err != nil {
+	if err != nil && !k8serr.IsAlreadyExists(err) {
 		return fmt.Errorf("create TLS secret: %v", err)
 	}
 	pxcHosts := []string{
-		"*." + cr.Name + "-pxc",
 		cr.Name + "-pxc",
+		"*." + cr.Name + "-pxc",
+		cr.Name + "-haproxy-replicas." + cr.Namespace + ".svc.cluster.local",
+		cr.Name + "-haproxy-replicas." + cr.Namespace,
+		cr.Name + "-haproxy-replicas",
+		cr.Name + "-haproxy." + cr.Namespace + ".svc.cluster.local",
+		cr.Name + "-haproxy." + cr.Namespace,
+		cr.Name + "-haproxy",
 	}
 	if cr.Spec.TLS != nil && len(cr.Spec.TLS.SANs) > 0 {
 		pxcHosts = append(pxcHosts, cr.Spec.TLS.SANs...)
@@ -292,7 +307,7 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLManualy(cr *api.PerconaXtraDBCl
 		Type: corev1.SecretTypeTLS,
 	}
 	err = r.client.Create(context.TODO(), &secretObjInternal)
-	if err != nil {
+	if err != nil && !k8serr.IsAlreadyExists(err) {
 		return fmt.Errorf("create TLS internal secret: %v", err)
 	}
 	return nil

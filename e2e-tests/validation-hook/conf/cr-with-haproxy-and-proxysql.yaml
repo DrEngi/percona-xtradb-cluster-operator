@@ -1,4 +1,4 @@
-apiVersion: pxc.percona.com/v1-6-0
+apiVersion: pxc.percona.com/v1
 kind: PerconaXtraDBCluster
 metadata:
   name: cluster1
@@ -9,7 +9,7 @@ metadata:
 #  annotations:
 #    percona.com/issue-vault-token: "true"
 spec:
-  crVersion: 1.6.0
+  crVersion: 1.10.0
   secretsName: my-cluster-secrets
   vaultSecretName: keyring-secret-vault
   sslSecretName: my-cluster-ssl
@@ -37,7 +37,6 @@ spec:
 #    schedulerName: mycustom-scheduler
 #    readinessDelaySec: 15
 #    livenessDelaySec: 300
-#    forceUnsafeBootstrap: false
 #    configuration: |
 #      [mysqld]
 #      wsrep_debug=ON
@@ -315,10 +314,10 @@ spec:
     image: percona/percona-xtradb-cluster-operator:1.6.0-pmm
     serverHost: monitoring-service
     serverUser: pmm
-#    resources:
-#      requests:
-#        memory: 200M
-#        cpu: 500m
+    resources:
+      requests:
+        memory: 200M
+        cpu: 500m
   backup:
     image: percona/percona-xtradb-cluster-operator:1.6.0-pxc8.0-backup
 #    serviceAccountName: percona-xtradb-cluster-operator

@@ -33,6 +33,12 @@ type PITR struct {
 
 // PerconaXtraDBClusterRestore is the Schema for the perconaxtradbclusterrestores API
 // +k8s:openapi-gen=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName="pxc-restore";"pxc-restores"
+// +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".spec.pxcCluster",description="Cluster name"
+// +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.state",description="Job status"
+// +kubebuilder:printcolumn:name="Completed",type="date",JSONPath=".status.completed",description="Completed time"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 type PerconaXtraDBClusterRestore struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -63,12 +69,14 @@ const (
 	RestoreSucceeded    BcpRestoreStates = "Succeeded"
 )
 
+const AnnotationUnsafePITR = "percona.com/unsafe-pitr"
+
 func (cr *PerconaXtraDBClusterRestore) CheckNsetDefaults() error {
 	if cr.Spec.PXCCluster == "" {
 		return errors.New("pxcCluster can't be empty")
 	}
-	if cr.Spec.PITR != nil && cr.Spec.PITR.BackupSource != nil && cr.Spec.PITR.BackupSource.StorageName == "" && cr.Spec.PITR.BackupSource.S3 == nil {
-		return errors.New("PITR.BackupSource.StorageName and PITR.BackupSource.S3 can't be empty simultaneously")
+	if cr.Spec.PITR != nil && cr.Spec.PITR.BackupSource != nil && cr.Spec.PITR.BackupSource.StorageName == "" && cr.Spec.PITR.BackupSource.S3 == nil && cr.Spec.PITR.BackupSource.Azure == nil {
+		return errors.New("PITR.BackupSource.StorageName, PITR.BackupSource.S3 and PITR.BackupSource.Azure can't be empty simultaneously")
 	}
 	if cr.Spec.BackupName == "" && cr.Spec.BackupSource == nil {
 		return errors.New("backupName and BackupSource can't be empty simultaneously")
@@ -78,8 +86,4 @@ func (cr *PerconaXtraDBClusterRestore) CheckNsetDefaults() error {
 	}
 
 	return nil
-}
-
-func init() {
-	SchemeBuilder.Register(&PerconaXtraDBClusterRestore{}, &PerconaXtraDBClusterRestoreList{})
 }

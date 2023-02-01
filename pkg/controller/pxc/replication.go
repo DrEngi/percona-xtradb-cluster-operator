@@ -55,7 +55,7 @@ func (r *ReconcilePerconaXtraDBCluster) ensurePxcPodServices(cr *api.PerconaXtra
 			return errors.Wrap(err, "failed to set owner to external service")
 		}
 
-		err = r.createOrUpdate(svc)
+		err = r.createOrUpdateService(cr, svc, len(cr.Spec.PXC.Expose.Annotations) == 0)
 		if err != nil {
 			return errors.Wrap(err, "failed to ensure pxc service")
 		}
@@ -96,7 +96,7 @@ func (r *ReconcilePerconaXtraDBCluster) removeOutdatedServices(cr *api.PerconaXt
 	return nil
 }
 
-func (r *ReconcilePerconaXtraDBCluster) reconcileReplication(cr *api.PerconaXtraDBCluster) error {
+func (r *ReconcilePerconaXtraDBCluster) reconcileReplication(cr *api.PerconaXtraDBCluster, replicaPassUpdated bool) error {
 	if cr.Status.PXC.Ready < 1 || cr.Spec.Pause {
 		return nil
 	}
@@ -149,7 +149,7 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileReplication(cr *api.PerconaXtra
 	user := "operator"
 	port := int32(33062)
 
-	primaryDB, err := queries.New(r.client, cr.Namespace, internalPrefix+cr.Name, user, primaryPod.Name+"."+cr.Name+"-pxc."+cr.Namespace, port)
+	primaryDB, err := queries.New(r.client, cr.Namespace, internalSecretsPrefix+cr.Name, user, primaryPod.Name+"."+cr.Name+"-pxc."+cr.Namespace, port, cr.Spec.PXC.ReadinessProbes.TimeoutSeconds)
 	if err != nil {
 		return errors.Wrapf(err, "failed to connect to pod %s", primaryPod.Name)
 	}
@@ -189,7 +189,7 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileReplication(cr *api.PerconaXtra
 			continue
 		}
 		if _, ok := pod.Labels[replicationPodLabel]; ok {
-			db, err := queries.New(r.client, cr.Namespace, internalPrefix+cr.Name, user, pod.Name+"."+cr.Name+"-pxc."+cr.Namespace, port)
+			db, err := queries.New(r.client, cr.Namespace, internalSecretsPrefix+cr.Name, user, pod.Name+"."+cr.Name+"-pxc."+cr.Namespace, port, cr.Spec.PXC.ReadinessProbes.TimeoutSeconds)
 			if err != nil {
 				return errors.Wrapf(err, "failed to connect to pod %s", pod.Name)
 			}
@@ -219,7 +219,7 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileReplication(cr *api.PerconaXtra
 	err = r.client.Get(context.TODO(),
 		types.NamespacedName{
 			Namespace: cr.Namespace,
-			Name:      internalPrefix + cr.Name,
+			Name:      internalSecretsPrefix + cr.Name,
 		},
 		&sysUsersSecretObj,
 	)
@@ -227,16 +227,42 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileReplication(cr *api.PerconaXtra
 		return errors.Wrap(err, "get secrets")
 	}
 
-	for _, channels := range cr.Spec.PXC.ReplicationChannels {
-		if channels.IsSource {
-			continue
-		}
-		err = manageReplicationChannel(r.log, primaryDB, channels, string(sysUsersSecretObj.Data["replication"]))
+	if replicaPassUpdated {
+		err = handleReplicaPasswordChange(primaryDB, string(sysUsersSecretObj.Data["replication"]))
 		if err != nil {
-			return errors.Wrapf(err, "manage replication channel %s", channels.Name)
+			return errors.Wrap(err, "failed to change replication password")
 		}
 	}
 
+	for _, channel := range cr.Spec.PXC.ReplicationChannels {
+		if channel.IsSource {
+			continue
+		}
+
+		currConf := currentReplicaConfig(channel.Name, cr.Status.PXCReplication)
+
+		err = manageReplicationChannel(r.log, primaryDB, channel, currConf, string(sysUsersSecretObj.Data["replication"]))
+		if err != nil {
+			return errors.Wrapf(err, "manage replication channel %s", channel.Name)
+		}
+		setReplicationChannelStatus(cr, channel)
+	}
+
+	return r.updateStatus(cr, false, nil)
+}
+
+func handleReplicaPasswordChange(db queries.Database, newPass string) error {
+	channels, err := db.CurrentReplicationChannels()
+	if err != nil {
+		return errors.Wrap(err, "get current replication channels")
+	}
+
+	for _, channel := range channels {
+		err := db.ChangeChannelPassword(channel, newPass)
+		if err != nil {
+			return errors.Wrapf(err, "change password for channel %s", channel)
+		}
+	}
 	return nil
 }
 
@@ -247,7 +273,7 @@ func checkReadonlyStatus(channels []api.ReplicationChannel, pods []corev1.Pod, c
 	}
 
 	for _, pod := range pods {
-		db, err := queries.New(client, cr.Namespace, internalPrefix+cr.Name, "operator", pod.Name+"."+cr.Name+"-pxc."+cr.Namespace, 33062)
+		db, err := queries.New(client, cr.Namespace, internalSecretsPrefix+cr.Name, "operator", pod.Name+"."+cr.Name+"-pxc."+cr.Namespace, 33062, cr.Spec.PXC.ReadinessProbes.TimeoutSeconds)
 		if err != nil {
 			return errors.Wrapf(err, "connect to pod %s", pod.Name)
 		}
@@ -321,7 +347,7 @@ func removeOutdatedChannels(db queries.Database, currentChannels []api.Replicati
 	return nil
 }
 
-func manageReplicationChannel(log logr.Logger, primaryDB queries.Database, channel api.ReplicationChannel, replicaPW string) error {
+func manageReplicationChannel(log logr.Logger, primaryDB queries.Database, channel api.ReplicationChannel, currConf api.ReplicationChannelConfig, replicaPW string) error {
 	currentSources, err := primaryDB.ReplicationChannelSources(channel.Name)
 	if err != nil && err != queries.ErrNotFound {
 		return errors.Wrapf(err, "get current replication sources for channel %s", channel.Name)
@@ -338,7 +364,8 @@ func manageReplicationChannel(log logr.Logger, primaryDB queries.Database, chann
 			return nil
 		}
 
-		if replicationStatus == queries.ReplicationStatusActive {
+		if replicationStatus == queries.ReplicationStatusActive &&
+			*channel.Config == currConf {
 			return nil
 		}
 	}
@@ -370,10 +397,17 @@ func manageReplicationChannel(log logr.Logger, primaryDB queries.Database, chann
 		}
 	}
 
-	return primaryDB.StartReplication(replicaPW, queries.ReplicationChannelSource{
-		Name: channel.Name,
-		Host: maxWeightSrc.Host,
-		Port: maxWeightSrc.Port,
+	return primaryDB.StartReplication(replicaPW, queries.ReplicationConfig{
+		Source: queries.ReplicationChannelSource{
+			Name: channel.Name,
+			Host: maxWeightSrc.Host,
+			Port: maxWeightSrc.Port,
+		},
+		SourceRetryCount:   channel.Config.SourceRetryCount,
+		SourceConnectRetry: channel.Config.SourceConnectRetry,
+		SSL:                channel.Config.SSL,
+		SSLSkipVerify:      channel.Config.SSLSkipVerify,
+		CA:                 channel.Config.CA,
 	})
 }
 
@@ -477,13 +511,21 @@ func NewExposedPXCService(svcName string, cr *api.PerconaXtraDBCluster) *corev1.
 		},
 	}
 
+	if cr.Spec.PXC.Expose.Type == corev1.ServiceTypeNodePort ||
+		cr.Spec.PXC.Expose.Type == corev1.ServiceTypeLoadBalancer {
+		switch cr.Spec.PXC.Expose.TrafficPolicy {
+		case corev1.ServiceExternalTrafficPolicyTypeLocal, corev1.ServiceExternalTrafficPolicyTypeCluster:
+			svc.Spec.ExternalTrafficPolicy = cr.Spec.PXC.Expose.TrafficPolicy
+		default:
+			svc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyTypeCluster
+		}
+	}
+
 	switch cr.Spec.PXC.Expose.Type {
 	case corev1.ServiceTypeNodePort:
 		svc.Spec.Type = corev1.ServiceTypeNodePort
-		svc.Spec.ExternalTrafficPolicy = "Local"
 	case corev1.ServiceTypeLoadBalancer:
 		svc.Spec.Type = corev1.ServiceTypeLoadBalancer
-		svc.Spec.ExternalTrafficPolicy = "Cluster"
 	default:
 		svc.Spec.Type = corev1.ServiceTypeClusterIP
 	}
@@ -502,4 +544,41 @@ func isPodReady(pod corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+func currentReplicaConfig(name string, status *api.ReplicationStatus) api.ReplicationChannelConfig {
+	res := api.ReplicationChannelConfig{}
+	if status == nil {
+		return res
+	}
+
+	for _, v := range status.Channels {
+		if v.Name == name {
+			return v.ReplicationChannelConfig
+		}
+	}
+	return res
+}
+
+func setReplicationChannelStatus(cr *api.PerconaXtraDBCluster, channel api.ReplicationChannel) {
+	status := api.ReplicationChannelStatus{
+		Name:                     channel.Name,
+		ReplicationChannelConfig: *channel.Config,
+	}
+
+	if cr.Status.PXCReplication == nil {
+		cr.Status.PXCReplication = &api.ReplicationStatus{
+			Channels: []api.ReplicationChannelStatus{status},
+		}
+		return
+	}
+
+	for k, v := range cr.Status.PXCReplication.Channels {
+		if channel.Name == v.Name {
+			cr.Status.PXCReplication.Channels[k] = status
+			return
+		}
+	}
+
+	cr.Status.PXCReplication.Channels = append(cr.Status.PXCReplication.Channels, status)
 }

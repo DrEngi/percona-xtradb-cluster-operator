@@ -3,6 +3,7 @@ package pxc
 import (
 	"context"
 	"crypto/md5"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -10,19 +11,19 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/percona/percona-xtradb-cluster-operator/pkg/pxc/app"
 
 	"github.com/pkg/errors"
 
-	api "github.com/percona/percona-xtradb-cluster-operator/pkg/apis/pxc/v1"
-	"github.com/percona/percona-xtradb-cluster-operator/pkg/pxc"
-	"github.com/percona/percona-xtradb-cluster-operator/pkg/pxc/queries"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	api "github.com/percona/percona-xtradb-cluster-operator/pkg/apis/pxc/v1"
+	"github.com/percona/percona-xtradb-cluster-operator/pkg/pxc"
+	"github.com/percona/percona-xtradb-cluster-operator/pkg/pxc/queries"
 )
 
 func (r *ReconcilePerconaXtraDBCluster) updatePod(sfs api.StatefulApp, podSpec *api.PodSpec, cr *api.PerconaXtraDBCluster, initContainers []corev1.Container) error {
@@ -51,9 +52,17 @@ func (r *ReconcilePerconaXtraDBCluster) updatePod(sfs api.StatefulApp, podSpec *
 		currentSet.Spec.Template.Labels[k] = v
 	}
 
+	err = r.reconcileConfigMap(cr)
+	if err != nil {
+		return errors.Wrap(err, "upgradePod/updateApp error: update db config error")
+	}
+
 	// embed DB configuration hash
 	// TODO: code duplication with deploy function
-	configHash := r.getConfigHash(cr, sfs)
+	configHash, err := r.getConfigHash(cr, sfs)
+	if err != nil {
+		return errors.Wrap(err, "getting config hash")
+	}
 
 	if currentSet.Spec.Template.Annotations == nil {
 		currentSet.Spec.Template.Annotations = make(map[string]string)
@@ -66,11 +75,6 @@ func (r *ReconcilePerconaXtraDBCluster) updatePod(sfs api.StatefulApp, podSpec *
 	}
 	if cr.CompareVersionWith("1.5.0") >= 0 {
 		currentSet.Spec.Template.Spec.ServiceAccountName = podSpec.ServiceAccountName
-	}
-
-	err = r.reconcileConfigMap(cr)
-	if err != nil {
-		return errors.Wrap(err, "upgradePod/updateApp error: update db config error")
 	}
 
 	// change TLS secret configuration
@@ -121,14 +125,21 @@ func (r *ReconcilePerconaXtraDBCluster) updatePod(sfs api.StatefulApp, podSpec *
 	var newContainers []corev1.Container
 	var newInitContainers []corev1.Container
 
-	secrets := cr.Spec.SecretsName
+	secretsName := cr.Spec.SecretsName
 	if cr.CompareVersionWith("1.6.0") >= 0 {
-		secrets = "internal-" + cr.Name
+		secretsName = "internal-" + cr.Name
 	}
 
+	secret := new(corev1.Secret)
+	err = r.client.Get(context.TODO(), types.NamespacedName{
+		Name: secretsName, Namespace: cr.Namespace,
+	}, secret)
+	if client.IgnoreNotFound(err) != nil {
+		return errors.Wrap(err, "get internal secret")
+	}
 	// pmm container
-	if cr.Spec.PMM != nil && cr.Spec.PMM.Enabled {
-		pmmC, err := sfs.PMMContainer(cr.Spec.PMM, secrets, cr)
+	if cr.Spec.PMM != nil && cr.Spec.PMM.IsEnabled(secret) {
+		pmmC, err := sfs.PMMContainer(cr.Spec.PMM, secret, cr)
 		if err != nil {
 			return errors.Wrap(err, "pmm container error")
 		}
@@ -139,7 +150,7 @@ func (r *ReconcilePerconaXtraDBCluster) updatePod(sfs api.StatefulApp, podSpec *
 
 	// log-collector container
 	if cr.Spec.LogCollector != nil && cr.Spec.LogCollector.Enabled && cr.CompareVersionWith("1.7.0") >= 0 {
-		logCollectorC, err := sfs.LogCollectorContainer(cr.Spec.LogCollector, cr.Spec.LogCollectorSecretName, secrets, cr)
+		logCollectorC, err := sfs.LogCollectorContainer(cr.Spec.LogCollector, cr.Spec.LogCollectorSecretName, secretsName, cr)
 		if err != nil {
 			return errors.Wrap(err, "logcollector container error")
 		}
@@ -155,7 +166,7 @@ func (r *ReconcilePerconaXtraDBCluster) updatePod(sfs api.StatefulApp, podSpec *
 	}
 
 	// application container
-	appC, err := sfs.AppContainer(podSpec, secrets, cr, sfsVolume.Volumes)
+	appC, err := sfs.AppContainer(podSpec, secretsName, cr, sfsVolume.Volumes)
 	if err != nil {
 		return errors.Wrap(err, "app container error")
 	}
@@ -167,21 +178,21 @@ func (r *ReconcilePerconaXtraDBCluster) updatePod(sfs api.StatefulApp, podSpec *
 	}
 
 	if podSpec.ForceUnsafeBootstrap {
-		ic := appC.DeepCopy()
-		res, err := app.CreateResources(podSpec.Resources)
-		if err != nil {
-			return errors.Wrap(err, "create resources")
+		r.log.Info("spec.pxc.forceUnsafeBootstrap option is not supported since v1.10")
+
+		if cr.CompareVersionWith("1.10.0") < 0 {
+			ic := appC.DeepCopy()
+			ic.Name = ic.Name + "-init-unsafe"
+			ic.Resources = podSpec.Resources
+			ic.ReadinessProbe = nil
+			ic.LivenessProbe = nil
+			ic.Command = []string{"/var/lib/mysql/unsafe-bootstrap.sh"}
+			newInitContainers = append(newInitContainers, *ic)
 		}
-		ic.Resources = res
-		ic.Name = ic.Name + "-init-unsafe"
-		ic.ReadinessProbe = nil
-		ic.LivenessProbe = nil
-		ic.Command = []string{"/var/lib/mysql/unsafe-bootstrap.sh"}
-		newInitContainers = append(newInitContainers, *ic)
 	}
 
 	// sidecars
-	sideC, err := sfs.SidecarContainers(podSpec, secrets, cr)
+	sideC, err := sfs.SidecarContainers(podSpec, secretsName, cr)
 	if err != nil {
 		return errors.Wrap(err, "sidecar container error")
 	}
@@ -195,8 +206,9 @@ func (r *ReconcilePerconaXtraDBCluster) updatePod(sfs api.StatefulApp, podSpec *
 	if sfsVolume != nil && sfsVolume.Volumes != nil {
 		currentSet.Spec.Template.Spec.Volumes = sfsVolume.Volumes
 	}
+	currentSet.Spec.Template.Spec.Volumes = api.AddSidecarVolumes(r.logger(cr.Name, cr.Namespace), currentSet.Spec.Template.Spec.Volumes, podSpec.SidecarVolumes)
 	currentSet.Spec.Template.Spec.Tolerations = podSpec.Tolerations
-	err = r.createOrUpdate(currentSet)
+	err = r.createOrUpdate(cr, currentSet)
 	if err != nil {
 		return errors.Wrap(err, "update error")
 	}
@@ -229,7 +241,24 @@ func (r *ReconcilePerconaXtraDBCluster) smartUpdate(sfs api.StatefulApp, cr *api
 		return errors.Wrap(err, "failed to get current sfs")
 	}
 
-	if currentSet.Status.UpdatedReplicas >= currentSet.Status.Replicas {
+	list := corev1.PodList{}
+	if err := r.client.List(context.TODO(),
+		&list,
+		&client.ListOptions{
+			Namespace:     currentSet.Namespace,
+			LabelSelector: labels.SelectorFromSet(sfs.Labels()),
+		},
+	); err != nil {
+		return errors.Wrap(err, "get pod list")
+	}
+	statefulSetChanged := false
+	for _, pod := range list.Items {
+		if pod.ObjectMeta.Labels["controller-revision-hash"] != currentSet.Status.UpdateRevision {
+			statefulSetChanged = true
+			break
+		}
+	}
+	if !statefulSetChanged {
 		return nil
 	}
 
@@ -250,17 +279,6 @@ func (r *ReconcilePerconaXtraDBCluster) smartUpdate(sfs api.StatefulApp, cr *api
 	if currentSet.Status.ReadyReplicas < currentSet.Status.Replicas {
 		logger.Info("can't start/continue 'SmartUpdate': waiting for all replicas are ready")
 		return nil
-	}
-
-	list := corev1.PodList{}
-	if err := r.client.List(context.TODO(),
-		&list,
-		&client.ListOptions{
-			Namespace:     currentSet.Namespace,
-			LabelSelector: labels.SelectorFromSet(sfs.Labels()),
-		},
-	); err != nil {
-		return errors.Wrap(err, "get pod list")
 	}
 
 	primary, err := r.getPrimaryPod(cr)
@@ -336,6 +354,10 @@ func (r *ReconcilePerconaXtraDBCluster) applyNWait(cr *api.PerconaXtraDBCluster,
 		return errors.Wrap(err, "failed to wait pxc sync")
 	}
 
+	if err := r.waitHostgroups(cr, sfs.Name, pod, waitLimit, logger); err != nil {
+		return errors.Wrap(err, "failed to wait hostgroups status")
+	}
+
 	if err := r.waitUntilOnline(cr, sfs.Name, pod, waitLimit, logger); err != nil {
 		return errors.Wrap(err, "failed to wait pxc status")
 	}
@@ -347,13 +369,12 @@ func getPodOrderInSts(stsName string, podName string) (int, error) {
 	return strconv.Atoi(podName[len(stsName)+1:])
 }
 
-func (r *ReconcilePerconaXtraDBCluster) waitUntilOnline(cr *api.PerconaXtraDBCluster, sfsName string, pod *corev1.Pod, waitLimit int, logger logr.Logger) error {
-	if cr.Spec.HAProxy != nil && cr.Spec.HAProxy.Enabled {
-		time.Sleep(5 * time.Second)
+func (r *ReconcilePerconaXtraDBCluster) waitHostgroups(cr *api.PerconaXtraDBCluster, sfsName string, pod *corev1.Pod, waitLimit int, logger logr.Logger) error {
+	if cr.Spec.ProxySQL == nil || !cr.Spec.ProxySQL.Enabled {
 		return nil
 	}
 
-	database, err := r.proxyDB(cr)
+	database, err := r.connectProxy(cr)
 	if err != nil {
 		return errors.Wrap(err, "failed to get proxySQL db")
 	}
@@ -364,7 +385,36 @@ func (r *ReconcilePerconaXtraDBCluster) waitUntilOnline(cr *api.PerconaXtraDBClu
 
 	return retry(time.Second*10, time.Duration(waitLimit)*time.Second,
 		func() (bool, error) {
-			statuses, err := database.Status(podNamePrefix, pod.Name+"."+cr.Name+"-pxc."+cr.Namespace)
+			present, err := database.PresentInHostgroups(podNamePrefix)
+			if err != nil && err != queries.ErrNotFound {
+				return false, errors.Wrap(err, "failed to get hostgroup status")
+			}
+			if !present {
+				return false, nil
+			}
+
+			logger.Info("pod present in hostgroups", "pod name", pod.Name)
+			return true, nil
+		})
+}
+
+func (r *ReconcilePerconaXtraDBCluster) waitUntilOnline(cr *api.PerconaXtraDBCluster, sfsName string, pod *corev1.Pod, waitLimit int, logger logr.Logger) error {
+	if cr.Spec.ProxySQL == nil || !cr.Spec.ProxySQL.Enabled {
+		return nil
+	}
+
+	database, err := r.connectProxy(cr)
+	if err != nil {
+		return errors.Wrap(err, "failed to get proxySQL db")
+	}
+
+	defer database.Close()
+
+	podNamePrefix := fmt.Sprintf("%s.%s.%s", pod.Name, sfsName, cr.Namespace)
+
+	return retry(time.Second*10, time.Duration(waitLimit)*time.Second,
+		func() (bool, error) {
+			statuses, err := database.ProxySQLInstanceStatus(podNamePrefix)
 			if err != nil && err != queries.ErrNotFound {
 				return false, errors.Wrap(err, "failed to get status")
 			}
@@ -413,17 +463,18 @@ func retry(in, limit time.Duration, f func() (bool, error)) error {
 	}
 }
 
-func (r *ReconcilePerconaXtraDBCluster) proxyDB(cr *api.PerconaXtraDBCluster) (queries.Database, error) {
+// connectProxy returns a new connection through the proxy (ProxySQL or HAProxy)
+func (r *ReconcilePerconaXtraDBCluster) connectProxy(cr *api.PerconaXtraDBCluster) (queries.Database, error) {
 	var database queries.Database
 	var user, host string
 	var port, proxySize int32
 
-	if cr.Spec.ProxySQL != nil && cr.Spec.ProxySQL.Enabled {
+	if cr.ProxySQLEnabled() {
 		user = "proxyadmin"
 		host = fmt.Sprintf("%s-proxysql-unready.%s", cr.ObjectMeta.Name, cr.Namespace)
 		proxySize = cr.Spec.ProxySQL.Size
 		port = 6032
-	} else if cr.Spec.HAProxy != nil && cr.Spec.HAProxy.Enabled {
+	} else if cr.HAProxyEnabled() {
 		user = "monitor"
 		host = fmt.Sprintf("%s-haproxy.%s", cr.Name, cr.Namespace)
 		proxySize = cr.Spec.HAProxy.Size
@@ -433,20 +484,21 @@ func (r *ReconcilePerconaXtraDBCluster) proxyDB(cr *api.PerconaXtraDBCluster) (q
 			return database, errors.Wrap(err, "check if config has proxy_protocol_networks key")
 		}
 
+		port = 3306
 		if hasKey && cr.CompareVersionWith("1.6.0") >= 0 {
 			port = 33062
-		} else {
-			port = 3306
 		}
 	} else {
 		return database, errors.New("can't detect enabled proxy, please enable HAProxy or ProxySQL")
 	}
+
 	secrets := cr.Spec.SecretsName
 	if cr.CompareVersionWith("1.6.0") >= 0 {
 		secrets = "internal-" + cr.Name
 	}
+
 	for i := 0; ; i++ {
-		db, err := queries.New(r.client, cr.Namespace, secrets, user, host, port)
+		db, err := queries.New(r.client, cr.Namespace, secrets, user, host, port, cr.Spec.PXC.ReadinessProbes.TimeoutSeconds)
 		if err != nil && i < int(proxySize) {
 			time.Sleep(time.Second)
 		} else if err != nil && i == int(proxySize) {
@@ -461,15 +513,14 @@ func (r *ReconcilePerconaXtraDBCluster) proxyDB(cr *api.PerconaXtraDBCluster) (q
 }
 
 func (r *ReconcilePerconaXtraDBCluster) getPrimaryPod(cr *api.PerconaXtraDBCluster) (string, error) {
-	database, err := r.proxyDB(cr)
+	conn, err := r.connectProxy(cr)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to get proxySQL db")
+		return "", errors.Wrap(err, "failed to get proxy connection")
 	}
+	defer conn.Close()
 
-	defer database.Close()
-
-	if cr.Spec.HAProxy != nil && cr.Spec.HAProxy.Enabled {
-		host, err := database.Hostname()
+	if cr.HAProxyEnabled() {
+		host, err := conn.Hostname()
 		if err != nil {
 			return "", err
 		}
@@ -477,7 +528,7 @@ func (r *ReconcilePerconaXtraDBCluster) getPrimaryPod(cr *api.PerconaXtraDBClust
 		return host, nil
 	}
 
-	return database.PrimaryHost()
+	return conn.PrimaryHost()
 }
 
 func (r *ReconcilePerconaXtraDBCluster) waitPXCSynced(cr *api.PerconaXtraDBCluster, host string, waitLimit int) error {
@@ -489,7 +540,7 @@ func (r *ReconcilePerconaXtraDBCluster) waitPXCSynced(cr *api.PerconaXtraDBClust
 		port = int32(33062)
 	}
 
-	database, err := queries.New(r.client, cr.Namespace, secrets, user, host, port)
+	database, err := queries.New(r.client, cr.Namespace, secrets, user, host, port, cr.Spec.PXC.ReadinessProbes.TimeoutSeconds)
 	if err != nil {
 		return errors.Wrap(err, "failed to access PXC database")
 	}
@@ -520,7 +571,7 @@ func (r *ReconcilePerconaXtraDBCluster) waitPodRestart(cr *api.PerconaXtraDBClus
 			}
 
 			// We update status in every loop to not wait until the end of smart update
-			if err := r.updateStatus(cr, nil); err != nil {
+			if err := r.updateStatus(cr, true, nil); err != nil {
 				return false, errors.Wrap(err, "update status")
 			}
 
@@ -602,16 +653,59 @@ func (r *ReconcilePerconaXtraDBCluster) isRestoreRunning(clusterName, namespace 
 	return false, nil
 }
 
-func (r *ReconcilePerconaXtraDBCluster) getConfigHash(cr *api.PerconaXtraDBCluster, sfs api.StatefulApp) string {
-	configString := cr.Spec.PXC.Configuration
-	if sfs.Labels()["app.kubernetes.io/component"] == "haproxy" {
-		configString = cr.Spec.HAProxy.Configuration
-	} else if sfs.Labels()["app.kubernetes.io/component"] == "proxysql" {
-		configString = cr.Spec.ProxySQL.Configuration
+func getCustomConfigHashHex(strData map[string]string, binData map[string][]byte) (string, error) {
+	content := struct {
+		StrData map[string]string `json:"str_data,omitempty"`
+		BinData map[string][]byte `json:"bin_data,omitempty"`
+	}{
+		StrData: strData,
+		BinData: binData,
 	}
-	hash := fmt.Sprintf("%x", md5.Sum([]byte(configString)))
 
-	return hash
+	allData, err := json.Marshal(content)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to concat data for config hash")
+	}
+
+	hashHex := fmt.Sprintf("%x", md5.Sum(allData))
+
+	return hashHex, nil
+}
+
+func (r *ReconcilePerconaXtraDBCluster) getConfigHash(cr *api.PerconaXtraDBCluster, sfs api.StatefulApp) (string, error) {
+	ls := sfs.Labels()
+
+	name := types.NamespacedName{
+		Namespace: cr.Namespace,
+		Name:      ls["app.kubernetes.io/instance"] + "-" + ls["app.kubernetes.io/component"],
+	}
+
+	obj, err := r.getFirstExisting(name, &corev1.Secret{}, &corev1.ConfigMap{})
+	if err != nil {
+		return "", errors.Wrap(err, "failed to get custom config")
+	}
+
+	switch obj := obj.(type) {
+	case *corev1.Secret:
+		return getCustomConfigHashHex(obj.StringData, obj.Data)
+	case *corev1.ConfigMap:
+		return getCustomConfigHashHex(obj.Data, obj.BinaryData)
+	default:
+		return fmt.Sprintf("%x", md5.Sum([]byte{})), nil
+	}
+}
+
+func (r *ReconcilePerconaXtraDBCluster) getFirstExisting(name types.NamespacedName, objs ...client.Object) (client.Object, error) {
+	for _, o := range objs {
+		err := r.client.Get(context.TODO(), name, o)
+		if err != nil && !k8serrors.IsNotFound(err) {
+			return nil, err
+		}
+		if err == nil {
+			return o, nil
+		}
+	}
+	return nil, nil
 }
 
 func (r *ReconcilePerconaXtraDBCluster) getSecretHash(cr *api.PerconaXtraDBCluster, secretName string, allowNonExistingSecret bool) (string, error) {

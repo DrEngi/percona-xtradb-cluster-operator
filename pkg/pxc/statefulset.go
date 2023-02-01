@@ -5,16 +5,16 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
-	api "github.com/percona/percona-xtradb-cluster-operator/pkg/apis/pxc/v1"
-	"github.com/percona/percona-xtradb-cluster-operator/pkg/pxc/app"
 	"github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	api "github.com/percona/percona-xtradb-cluster-operator/pkg/apis/pxc/v1"
 )
 
 // StatefulSet returns StatefulSet according for app to podSpec
-func StatefulSet(sfs api.StatefulApp, podSpec *api.PodSpec, cr *api.PerconaXtraDBCluster,
+func StatefulSet(sfs api.StatefulApp, podSpec *api.PodSpec, cr *api.PerconaXtraDBCluster, secret *corev1.Secret,
 	initContainers []corev1.Container, log logr.Logger, vg api.CustomVolumeGetter) (*appsv1.StatefulSet, error) {
 
 	pod := corev1.PodSpec{
@@ -30,10 +30,7 @@ func StatefulSet(sfs api.StatefulApp, podSpec *api.PodSpec, cr *api.PerconaXtraD
 	if cr.CompareVersionWith("1.5.0") >= 0 {
 		pod.ServiceAccountName = podSpec.ServiceAccountName
 	}
-	secrets := cr.Spec.SecretsName
-	if cr.CompareVersionWith("1.6.0") >= 0 {
-		secrets = "internal-" + cr.Name
-	}
+	secrets := secret.Name
 	pod.Affinity = PodAffinity(podSpec.Affinity, sfs)
 
 	if sfs.Labels()["app.kubernetes.io/component"] == "haproxy" && cr.CompareVersionWith("1.7.0") == -1 {
@@ -56,12 +53,16 @@ func StatefulSet(sfs api.StatefulApp, podSpec *api.PodSpec, cr *api.PerconaXtraD
 	}
 
 	if cr.Spec.PMM != nil && cr.Spec.PMM.Enabled {
-		pmmC, err := sfs.PMMContainer(cr.Spec.PMM, secrets, cr)
-		if err != nil {
-			return nil, fmt.Errorf("pmm container error: %v", err)
-		}
-		if pmmC != nil {
-			pod.Containers = append(pod.Containers, *pmmC)
+		if !cr.Spec.PMM.HasSecret(secret) {
+			log.Info(fmt.Sprintf(`Can't enable PMM: either "pmmserverkey" key doesn't exist in the %s, or %s and %s secrets are out of sync`, cr.Spec.SecretsName, cr.Spec.SecretsName, "internal-"+cr.Name))
+		} else {
+			pmmC, err := sfs.PMMContainer(cr.Spec.PMM, secret, cr)
+			if err != nil {
+				return nil, errors.Wrap(err, "pmm container error")
+			}
+			if pmmC != nil {
+				pod.Containers = append(pod.Containers, *pmmC)
+			}
 		}
 	}
 
@@ -79,14 +80,10 @@ func StatefulSet(sfs api.StatefulApp, podSpec *api.PodSpec, cr *api.PerconaXtraD
 		pod.InitContainers = append(pod.InitContainers, initContainers...)
 	}
 
-	if podSpec.ForceUnsafeBootstrap {
+	if podSpec.ForceUnsafeBootstrap && cr.CompareVersionWith("1.10.0") < 0 {
 		ic := appC.DeepCopy()
 		ic.Name = ic.Name + "-init-unsafe"
-		res, err := app.CreateResources(podSpec.Resources)
-		if err != nil {
-			return nil, errors.Wrap(err, "create resources")
-		}
-		ic.Resources = res
+		ic.Resources = podSpec.Resources
 		ic.ReadinessProbe = nil
 		ic.LivenessProbe = nil
 		ic.Command = []string{"/var/lib/mysql/unsafe-bootstrap.sh"}
@@ -100,6 +97,7 @@ func StatefulSet(sfs api.StatefulApp, podSpec *api.PodSpec, cr *api.PerconaXtraD
 	pod.Containers = append(pod.Containers, appC)
 	pod.Containers = append(pod.Containers, sideC...)
 	pod.Containers = api.AddSidecarContainers(log, pod.Containers, podSpec.Sidecars)
+	pod.Volumes = api.AddSidecarVolumes(log, pod.Volumes, podSpec.SidecarVolumes)
 
 	ls := sfs.Labels()
 
@@ -134,6 +132,7 @@ func StatefulSet(sfs api.StatefulApp, podSpec *api.PodSpec, cr *api.PerconaXtraD
 	if sfsVolume != nil && sfsVolume.PVCs != nil {
 		obj.Spec.VolumeClaimTemplates = sfsVolume.PVCs
 	}
+	obj.Spec.VolumeClaimTemplates = api.AddSidecarPVCs(log, obj.Spec.VolumeClaimTemplates, podSpec.SidecarPVCs)
 
 	return obj, nil
 }

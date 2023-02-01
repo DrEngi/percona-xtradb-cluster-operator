@@ -1,8 +1,8 @@
 package backup
 
 import (
-	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -38,16 +38,18 @@ func (*Backup) Job(cr *api.PerconaXtraDBClusterBackup, cluster *api.PerconaXtraD
 	}
 }
 
-func (bcp *Backup) JobSpec(spec api.PXCBackupSpec, cluster api.PerconaXtraDBClusterSpec, job *batchv1.Job) (batchv1.JobSpec, error) {
-	resources, err := app.CreateResources(cluster.Backup.Storages[spec.StorageName].Resources)
-	if err != nil {
-		return batchv1.JobSpec{}, fmt.Errorf("cannot parse Backup resources: %w", err)
-	}
-
+func (bcp *Backup) JobSpec(spec api.PXCBackupSpec, cluster *api.PerconaXtraDBCluster, job *batchv1.Job) (batchv1.JobSpec, error) {
 	manualSelector := true
-	backbackoffLimit := int32(10)
+	backoffLimit := int32(10)
+	if cluster.CompareVersionWith("1.11.0") >= 0 && cluster.Spec.Backup.BackoffLimit != nil {
+		backoffLimit = *cluster.Spec.Backup.BackoffLimit
+	}
+	verifyTLS := true
+	if cluster.Spec.Backup.Storages[spec.StorageName].VerifyTLS != nil {
+		verifyTLS = *cluster.Spec.Backup.Storages[spec.StorageName].VerifyTLS
+	}
 	return batchv1.JobSpec{
-		BackoffLimit:   &backbackoffLimit,
+		BackoffLimit:   &backoffLimit,
 		ManualSelector: &manualSelector,
 		Selector: &metav1.LabelSelector{
 			MatchLabels: job.Labels,
@@ -55,18 +57,18 @@ func (bcp *Backup) JobSpec(spec api.PXCBackupSpec, cluster api.PerconaXtraDBClus
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      job.Labels,
-				Annotations: cluster.Backup.Storages[spec.StorageName].Annotations,
+				Annotations: cluster.Spec.Backup.Storages[spec.StorageName].Annotations,
 			},
 			Spec: corev1.PodSpec{
-				SecurityContext:    cluster.Backup.Storages[spec.StorageName].PodSecurityContext,
+				SecurityContext:    cluster.Spec.Backup.Storages[spec.StorageName].PodSecurityContext,
 				ImagePullSecrets:   bcp.imagePullSecrets,
 				RestartPolicy:      corev1.RestartPolicyNever,
-				ServiceAccountName: cluster.Backup.ServiceAccountName,
+				ServiceAccountName: cluster.Spec.Backup.ServiceAccountName,
 				Containers: []corev1.Container{
 					{
 						Name:            "xtrabackup",
 						Image:           bcp.image,
-						SecurityContext: cluster.Backup.Storages[spec.StorageName].ContainerSecurityContext,
+						SecurityContext: cluster.Spec.Backup.Storages[spec.StorageName].ContainerSecurityContext,
 						ImagePullPolicy: bcp.imagePullPolicy,
 						Command:         []string{"bash", "/usr/bin/backup.sh"},
 						Env: []corev1.EnvVar{
@@ -81,31 +83,35 @@ func (bcp *Backup) JobSpec(spec api.PXCBackupSpec, cluster api.PerconaXtraDBClus
 							{
 								Name: "PXC_PASS",
 								ValueFrom: &corev1.EnvVarSource{
-									SecretKeyRef: app.SecretKeySelector(cluster.SecretsName, "xtrabackup"),
+									SecretKeyRef: app.SecretKeySelector(cluster.Spec.SecretsName, "xtrabackup"),
 								},
 							},
+							{
+								Name:  "VERIFY_TLS",
+								Value: strconv.FormatBool(verifyTLS),
+							},
 						},
-						Resources: resources,
+						Resources: cluster.Spec.Backup.Storages[spec.StorageName].Resources,
 					},
 				},
-				Affinity:          cluster.Backup.Storages[spec.StorageName].Affinity,
-				Tolerations:       cluster.Backup.Storages[spec.StorageName].Tolerations,
-				NodeSelector:      cluster.Backup.Storages[spec.StorageName].NodeSelector,
-				SchedulerName:     cluster.Backup.Storages[spec.StorageName].SchedulerName,
-				PriorityClassName: cluster.Backup.Storages[spec.StorageName].PriorityClassName,
-				RuntimeClassName:  cluster.Backup.Storages[spec.StorageName].RuntimeClassName,
+				Affinity:          cluster.Spec.Backup.Storages[spec.StorageName].Affinity,
+				Tolerations:       cluster.Spec.Backup.Storages[spec.StorageName].Tolerations,
+				NodeSelector:      cluster.Spec.Backup.Storages[spec.StorageName].NodeSelector,
+				SchedulerName:     cluster.Spec.Backup.Storages[spec.StorageName].SchedulerName,
+				PriorityClassName: cluster.Spec.Backup.Storages[spec.StorageName].PriorityClassName,
+				RuntimeClassName:  cluster.Spec.Backup.Storages[spec.StorageName].RuntimeClassName,
 			},
 		},
 	}, nil
 }
 
-func appendStorageSecret(job *batchv1.JobSpec, cr *api.PerconaXtraDBCluster) error {
+func appendStorageSecret(job *batchv1.JobSpec, cr *api.PerconaXtraDBClusterBackup) error {
 	// Volume for secret
 	secretVol := corev1.Volume{
 		Name: "ssl",
 	}
 	secretVol.Secret = &corev1.SecretVolumeSource{}
-	secretVol.Secret.SecretName = cr.Spec.PXC.SSLSecretName
+	secretVol.Secret.SecretName = cr.Status.SSLSecretName
 	t := true
 	secretVol.Secret.Optional = &t
 
@@ -114,7 +120,7 @@ func appendStorageSecret(job *batchv1.JobSpec, cr *api.PerconaXtraDBCluster) err
 		Name: "ssl-internal",
 	}
 	secretIntVol.Secret = &corev1.SecretVolumeSource{}
-	secretIntVol.Secret.SecretName = cr.Spec.PXC.SSLInternalSecretName
+	secretIntVol.Secret.SecretName = cr.Status.SSLInternalSecretName
 	secretIntVol.Secret.Optional = &t
 
 	// Volume for vault secret
@@ -122,7 +128,7 @@ func appendStorageSecret(job *batchv1.JobSpec, cr *api.PerconaXtraDBCluster) err
 		Name: "vault-keyring-secret",
 	}
 	secretVaultVol.Secret = &corev1.SecretVolumeSource{}
-	secretVaultVol.Secret.SecretName = cr.Spec.PXC.VaultSecretName
+	secretVaultVol.Secret.SecretName = cr.Status.VaultSecretName
 	secretVaultVol.Secret.Optional = &t
 
 	if len(job.Template.Spec.Containers) == 0 {
@@ -153,7 +159,7 @@ func appendStorageSecret(job *batchv1.JobSpec, cr *api.PerconaXtraDBCluster) err
 	return nil
 }
 
-func (Backup) SetStoragePVC(job *batchv1.JobSpec, cr *api.PerconaXtraDBCluster, volName string) error {
+func SetStoragePVC(job *batchv1.JobSpec, cr *api.PerconaXtraDBClusterBackup, volName string) error {
 	pvc := corev1.Volume{
 		Name: "xtrabackup",
 	}
@@ -184,7 +190,62 @@ func (Backup) SetStoragePVC(job *batchv1.JobSpec, cr *api.PerconaXtraDBCluster, 
 	return nil
 }
 
-func (Backup) SetStorageS3(job *batchv1.JobSpec, cr *api.PerconaXtraDBCluster, s3 api.BackupStorageS3Spec, destination string) error {
+func SetStorageAzure(job *batchv1.JobSpec, cr *api.PerconaXtraDBClusterBackup) error {
+	if cr.Status.Azure == nil {
+		return errors.New("azure storage is not specified in backup status")
+	}
+	azure := cr.Status.Azure
+	storageAccount := corev1.EnvVar{
+		Name: "AZURE_STORAGE_ACCOUNT",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: app.SecretKeySelector(azure.CredentialsSecret, "AZURE_STORAGE_ACCOUNT_NAME"),
+		},
+	}
+	accessKey := corev1.EnvVar{
+		Name: "AZURE_ACCESS_KEY",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: app.SecretKeySelector(azure.CredentialsSecret, "AZURE_STORAGE_ACCOUNT_KEY"),
+		},
+	}
+	container, _ := azure.ContainerAndPrefix()
+	containerName := corev1.EnvVar{
+		Name:  "AZURE_CONTAINER_NAME",
+		Value: container,
+	}
+	endpoint := corev1.EnvVar{
+		Name:  "AZURE_ENDPOINT",
+		Value: azure.Endpoint,
+	}
+	storageClass := corev1.EnvVar{
+		Name:  "AZURE_STORAGE_CLASS",
+		Value: azure.StorageClass,
+	}
+	backupPath := corev1.EnvVar{
+		Name:  "BACKUP_PATH",
+		Value: strings.TrimPrefix(cr.Status.Destination, container+"/"),
+	}
+	if len(job.Template.Spec.Containers) == 0 {
+		return errors.New("no containers in job spec")
+	}
+	job.Template.Spec.Containers[0].Env = append(job.Template.Spec.Containers[0].Env, storageAccount, accessKey, containerName, endpoint, storageClass, backupPath)
+
+	// add SSL volumes
+	job.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{}
+	job.Template.Spec.Volumes = []corev1.Volume{}
+
+	err := appendStorageSecret(job, cr)
+	if err != nil {
+		return errors.Wrap(err, "failed to append storage secrets")
+	}
+
+	return nil
+}
+
+func SetStorageS3(job *batchv1.JobSpec, cr *api.PerconaXtraDBClusterBackup) error {
+	if cr.Status.S3 == nil {
+		return errors.New("s3 storage is not specified in backup status")
+	}
+	s3 := cr.Status.S3
 	accessKey := corev1.EnvVar{
 		Name: "ACCESS_KEY_ID",
 		ValueFrom: &corev1.EnvVarSource{
@@ -211,7 +272,7 @@ func (Backup) SetStorageS3(job *batchv1.JobSpec, cr *api.PerconaXtraDBCluster, s
 	}
 	job.Template.Spec.Containers[0].Env = append(job.Template.Spec.Containers[0].Env, accessKey, secretKey, region, endpoint)
 
-	u, err := parseS3URL(destination)
+	u, err := parseS3URL(cr.Status.Destination)
 	if err != nil {
 		return errors.Wrap(err, "failed to create job")
 	}
