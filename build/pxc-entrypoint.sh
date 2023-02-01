@@ -3,6 +3,8 @@ set -eo pipefail
 shopt -s nullglob
 set -o xtrace
 
+trap "exit" SIGTERM
+
 # if command starts with an option, prepend mysqld
 if [ "${1:0:1}" = '-' ]; then
 	set -- mysqld "$@"
@@ -37,7 +39,7 @@ file_env() {
 	if [ "${!var:-}" ]; then
 		val="${!var}"
 	elif [ "${!fileVar:-}" ]; then
-		val="$(< "${!fileVar}")"
+		val="$(<"${!fileVar}")"
 	elif [ "${3:-}" ] && [ -f "/etc/mysql/mysql-users-secret/$3" ]; then
 		val="$(</etc/mysql/mysql-users-secret/$3)"
 	fi
@@ -147,6 +149,13 @@ function join {
 	echo "${joined%?}"
 }
 
+escape_special() {
+	echo "$1" \
+		| sed 's/\\/\\\\/g' \
+		| sed 's/'\''/'\\\\\''/g' \
+		| sed 's/"/\\\"/g'
+}
+
 MYSQL_VERSION=$(mysqld -V | awk '{print $3}' | awk -F'.' '{print $1"."$2}')
 MYSQL_PATCH_VERSION=$(mysqld -V | awk '{print $3}' | awk -F'.' '{print $3}' | awk -F'-' '{print $1}')
 
@@ -179,13 +188,13 @@ fi
 # add sst.cpat to exclude pxc-entrypoint, unsafe-bootstrap, pxc-configure-pxc from SST cleanup
 grep -q "^progress=" $CFG && sed -i "s|^progress=.*|progress=1|" $CFG
 grep -q "^\[sst\]" "$CFG" || printf '[sst]\n' >>"$CFG"
-grep -q "^cpat=" "$CFG" || sed '/^\[sst\]/a cpat=.*\\.pem$\\|.*init\\.ok$\\|.*galera\\.cache$\\|.*wsrep_recovery_verbose\\.log$\\|.*readiness-check\\.sh$\\|.*liveness-check\\.sh$\\|.*sst_in_progress$\\|.*sst-xb-tmpdir$\\|.*\\.sst$\\|.*gvwstate\\.dat$\\|.*grastate\\.dat$\\|.*\\.err$\\|.*\\.log$\\|.*RPM_UPGRADE_MARKER$\\|.*RPM_UPGRADE_HISTORY$\\|.*pxc-entrypoint\\.sh$\\|.*unsafe-bootstrap\\.sh$\\|.*pxc-configure-pxc\\.sh\\|.*peer-list$' "$CFG" 1<>"$CFG"
-if [[ "$MYSQL_VERSION" == '8.0' ]]; then
-       if [[ $MYSQL_PATCH_VERSION -ge 26 ]]; then
-               grep -q "^skip_replica_start=ON" "$CFG" || sed -i "/\[mysqld\]/a skip_replica_start=ON" $CFG
-       else
-               grep -q "^skip_slave_start=ON" "$CFG" || sed -i "/\[mysqld\]/a skip_slave_start=ON" $CFG
-       fi
+grep -q "^cpat=" "$CFG" || sed '/^\[sst\]/a cpat=.*\\.pem$\\|.*init\\.ok$\\|.*galera\\.cache$\\|.*wsrep_recovery_verbose\\.log$\\|.*readiness-check\\.sh$\\|.*liveness-check\\.sh$\\|.*get-pxc-state$\\|.*sst_in_progress$\\|.*sst-xb-tmpdir$\\|.*\\.sst$\\|.*gvwstate\\.dat$\\|.*grastate\\.dat$\\|.*\\.err$\\|.*\\.log$\\|.*RPM_UPGRADE_MARKER$\\|.*RPM_UPGRADE_HISTORY$\\|.*pxc-entrypoint\\.sh$\\|.*unsafe-bootstrap\\.sh$\\|.*pxc-configure-pxc\\.sh\\|.*peer-list$' "$CFG" 1<>"$CFG"
+if [[ $MYSQL_VERSION == '8.0' ]]; then
+	if [[ $MYSQL_PATCH_VERSION -ge 26 ]]; then
+		grep -q "^skip_replica_start=ON" "$CFG" || sed -i "/\[mysqld\]/a skip_replica_start=ON" $CFG
+	else
+		grep -q "^skip_slave_start=ON" "$CFG" || sed -i "/\[mysqld\]/a skip_slave_start=ON" $CFG
+	fi
 fi
 
 file_env 'XTRABACKUP_PASSWORD' 'xtrabackup' 'xtrabackup'
@@ -252,6 +261,12 @@ else
 		sed -r "s|^[#]?wsrep_cluster_name=.*$|wsrep_cluster_name=${CLUSTER_NAME}|" "${CFG}" 1<>"${CFG}"
 	fi
 
+fi
+
+WSREP_CLUSTER_NAME=$(grep wsrep_cluster_name ${CFG} | cut -d '=' -f 2 | tr -d ' ')
+if [[ -z ${WSREP_CLUSTER_NAME} || ${WSREP_CLUSTER_NAME} == 'noname' ]]; then
+	echo "Cluster name is invalid, please check DNS"
+	exit 1
 fi
 
 # if we have CLUSTER_JOIN - then we do not need to perform datadir initialize
@@ -333,45 +348,57 @@ if [ -z "$CLUSTER_JOIN" ] && [ "$1" = 'mysqld' -a -z "$wantHelp" ]; then
 			# no, we don't care if read finds a terminating character in this heredoc
 			# https://unix.stackexchange.com/questions/265149/why-is-set-o-errexit-breaking-this-read-heredoc-expression/265151#265151
 			read -r -d '' rootCreate <<-EOSQL || true
-				CREATE USER 'root'@'${MYSQL_ROOT_HOST}' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}' ;
+				CREATE USER 'root'@'${MYSQL_ROOT_HOST}' IDENTIFIED BY '$(escape_special "${MYSQL_ROOT_PASSWORD}")' ;
 				GRANT ALL ON *.* TO 'root'@'${MYSQL_ROOT_HOST}' WITH GRANT OPTION ;
 			EOSQL
 		fi
 
 		file_env 'MONITOR_HOST' 'localhost'
 		file_env 'MONITOR_PASSWORD' 'monitor' 'monitor'
-		file_env 'REPLICATION_PASSWORD' '' 'replication'
+		file_env 'REPLICATION_PASSWORD' 'replication' 'replication'
 		if [ "$MYSQL_VERSION" == '8.0' ]; then
 			read -r -d '' monitorConnectGrant <<-EOSQL || true
 				GRANT SERVICE_CONNECTION_ADMIN ON *.* TO 'monitor'@'${MONITOR_HOST}';
 			EOSQL
 		fi
+
+		# SYSTEM_USER since 8.0.16
+		# https://dev.mysql.com/doc/refman/8.0/en/privileges-provided.html#priv_system-user
+		if [[ $MYSQL_VERSION == "8.0" ]] && ((MYSQL_PATCH_VERSION >= 16)); then
+			read -r -d '' systemUserGrant <<-EOSQL || true
+				GRANT SYSTEM_USER ON *.* TO 'monitor'@'${MONITOR_HOST}';
+				GRANT SYSTEM_USER ON *.* TO 'clustercheck'@'localhost';
+			EOSQL
+		fi
+
 		"${mysql[@]}" <<-EOSQL
 			-- What's done in this file shouldn't be replicated
 			--  or products like mysql-fabric won't work
 			SET @@SESSION.SQL_LOG_BIN=0;
 
 			DELETE FROM mysql.user WHERE user NOT IN ('mysql.sys', 'mysqlxsys', 'root', 'mysql.infoschema', 'mysql.pxc.internal.session', 'mysql.pxc.sst.role', 'mysql.session') OR host NOT IN ('localhost') ;
-			ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}' ;
+			ALTER USER 'root'@'localhost' IDENTIFIED BY '$(escape_special "${MYSQL_ROOT_PASSWORD}")' ;
 			GRANT ALL ON *.* TO 'root'@'localhost' WITH GRANT OPTION ;
 			${rootCreate}
 			/*!80016 REVOKE SYSTEM_USER ON *.* FROM root */;
 
-			CREATE USER 'operator'@'${MYSQL_ROOT_HOST}' IDENTIFIED BY '${OPERATOR_ADMIN_PASSWORD}' ;
+			CREATE USER 'operator'@'${MYSQL_ROOT_HOST}' IDENTIFIED BY '$(escape_special "${OPERATOR_ADMIN_PASSWORD}")' ;
 			GRANT ALL ON *.* TO 'operator'@'${MYSQL_ROOT_HOST}' WITH GRANT OPTION ;
 
-			CREATE USER 'xtrabackup'@'%' IDENTIFIED BY '${XTRABACKUP_PASSWORD}';
+			CREATE USER 'xtrabackup'@'%' IDENTIFIED BY '$(escape_special "${XTRABACKUP_PASSWORD}")';
 			GRANT ALL ON *.* TO 'xtrabackup'@'%';
 
-			CREATE USER 'monitor'@'${MONITOR_HOST}' IDENTIFIED BY '${MONITOR_PASSWORD}' WITH MAX_USER_CONNECTIONS 100;
+			CREATE USER 'monitor'@'${MONITOR_HOST}' IDENTIFIED BY '$(escape_special "${MONITOR_PASSWORD}")' WITH MAX_USER_CONNECTIONS 100;
 			GRANT SELECT, PROCESS, SUPER, REPLICATION CLIENT, RELOAD ON *.* TO 'monitor'@'${MONITOR_HOST}';
 			GRANT SELECT ON performance_schema.* TO 'monitor'@'${MONITOR_HOST}';
 			${monitorConnectGrant}
 
-			CREATE USER 'clustercheck'@'localhost' IDENTIFIED BY '${CLUSTERCHECK_PASSWORD}';
+			CREATE USER 'clustercheck'@'localhost' IDENTIFIED BY '$(escape_special "${CLUSTERCHECK_PASSWORD}")';
 			GRANT PROCESS ON *.* TO 'clustercheck'@'localhost';
 
-			CREATE USER 'replication'@'%' IDENTIFIED BY '${REPLICATION_PASSWORD}';
+			${systemUserGrant}
+
+			CREATE USER 'replication'@'%' IDENTIFIED BY '$(escape_special "${REPLICATION_PASSWORD}")';
 			GRANT REPLICATION SLAVE ON *.* to 'replication'@'%';
 			DROP DATABASE IF EXISTS test;
 			FLUSH PRIVILEGES ;
@@ -530,7 +557,7 @@ if [ "$1" = 'mysqld' -a -z "$wantHelp" ]; then
 	fi
 	if [ -n "$PXC_SERVICE" ]; then
 		function get_primary() {
-			peer-list -on-start=/usr/bin/get-pxc-state -service="$PXC_SERVICE" 2>&1 \
+			peer-list -on-start=/var/lib/mysql/get-pxc-state -service="$PXC_SERVICE" 2>&1 \
 				| grep wsrep_ready:ON:wsrep_connected:ON:wsrep_local_state_comment:Synced:wsrep_cluster_status:Primary \
 				| sort \
 				| tail -1 \
@@ -564,7 +591,9 @@ if [ "$1" = 'mysqld' -a -z "$wantHelp" ]; then
 
 		is_primary_exists=$(get_primary)
 		is_manual_recovery
-		if [[ -z $is_primary_exists && -f $grastate_loc && $safe_to_bootstrap != 1 ]] || [[ -z $is_primary_exists && -f "${DATADIR}/gvwstate.dat" ]]; then
+		if [[ -z $is_primary_exists && -f $grastate_loc && $safe_to_bootstrap != 1 ]] \
+			|| [[ -z $is_primary_exists && -f "${DATADIR}/gvwstate.dat" ]] \
+			|| [[ -z $is_primary_exists && -f $grastate_loc && $safe_to_bootstrap == 1 && -n ${CLUSTER_JOIN} ]]; then
 			trap '{ node_recovery "$@" ; }' USR1
 			touch /tmp/recovery-case
 			if [[ -z ${seqno} ]]; then
@@ -595,5 +624,7 @@ if [ "$1" = 'mysqld' -a -z "$wantHelp" ]; then
 		fi
 	fi
 fi
+
+test -e /opt/percona/hookscript/hook.sh && source /opt/percona/hookscript/hook.sh
 
 exec "$@" $wsrep_start_position_opt

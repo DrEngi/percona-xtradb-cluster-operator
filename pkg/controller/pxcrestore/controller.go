@@ -12,14 +12,15 @@ import (
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8sretry "k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -90,8 +91,7 @@ type ReconcilePerconaXtraDBClusterRestore struct {
 }
 
 func (r *ReconcilePerconaXtraDBClusterRestore) logger(name, namespace string) logr.Logger {
-	return log.NewDelegatingLogger(r.log).WithName("perconaxtradbclusterrestore").
-		WithValues("restore", name, "namespace", namespace)
+	return r.log.WithName("perconaxtradbclusterrestore").WithValues("restore", name, "namespace", namespace)
 }
 
 // Reconcile reads that state of the cluster for a PerconaXtraDBClusterRestore object and makes changes based on the state read
@@ -99,7 +99,7 @@ func (r *ReconcilePerconaXtraDBClusterRestore) logger(name, namespace string) lo
 // Note:
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
-func (r *ReconcilePerconaXtraDBClusterRestore) Reconcile(request reconcile.Request) (reconcile.Result, error) {
+func (r *ReconcilePerconaXtraDBClusterRestore) Reconcile(_ context.Context, request reconcile.Request) (reconcile.Result, error) {
 	rr := reconcile.Result{}
 
 	cr := &api.PerconaXtraDBClusterRestore{}
@@ -164,14 +164,24 @@ func (r *ReconcilePerconaXtraDBClusterRestore) Reconcile(request reconcile.Reque
 		return rr, errors.Wrap(err, "get backup")
 	}
 
-	cluster := api.PerconaXtraDBCluster{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Spec.PXCCluster, Namespace: cr.Namespace}, &cluster)
+	annotations := cr.GetAnnotations()
+	_, unsafePITR := annotations[api.AnnotationUnsafePITR]
+	cond := meta.FindStatusCondition(bcp.Status.Conditions, api.BackupConditionPITRReady)
+	if cond != nil && cond.Status == metav1.ConditionFalse && !unsafePITR {
+		msg := fmt.Sprintf("Backup doesn't guarantee consistent recovery with PITR. Annotate PerconaXtraDBClusterRestore with %s to force it.", api.AnnotationUnsafePITR)
+		err = errors.New(msg)
+		return reconcile.Result{}, nil
+	}
+
+	cluster := new(api.PerconaXtraDBCluster)
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Spec.PXCCluster, Namespace: cr.Namespace}, cluster)
 	if err != nil {
 		err = errors.Wrapf(err, "get cluster %s", cr.Spec.PXCCluster)
 		return rr, err
 	}
+	clusterOrig := cluster.DeepCopy()
 
-	_, err = cluster.CheckNSetDefaults(r.serverVersion, r.log)
+	err = cluster.CheckNSetDefaults(r.serverVersion, r.log)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("wrong PXC options: %v", err)
 	}
@@ -194,7 +204,7 @@ func (r *ReconcilePerconaXtraDBClusterRestore) Reconcile(request reconcile.Reque
 		err = errors.Wrap(err, "set status")
 		return rr, err
 	}
-	err = r.restore(cr, bcp, cluster.Spec)
+	err = r.restore(cr, bcp, cluster)
 	if err != nil {
 		err = errors.Wrap(err, "run restore")
 		return rr, err
@@ -213,7 +223,7 @@ func (r *ReconcilePerconaXtraDBClusterRestore) Reconcile(request reconcile.Reque
 		cluster.Spec.PXC.Size = 1
 		cluster.Spec.AllowUnsafeConfig = true
 
-		if err := r.startCluster(&cluster); err != nil {
+		if err := r.startCluster(cluster); err != nil {
 			return rr, errors.Wrap(err, "restart cluster for pitr")
 		}
 
@@ -223,7 +233,7 @@ func (r *ReconcilePerconaXtraDBClusterRestore) Reconcile(request reconcile.Reque
 			return rr, errors.Wrap(err, "set status")
 		}
 
-		err = r.pitr(cr, bcp, cluster.Spec)
+		err = r.pitr(cr, bcp, cluster)
 		if err != nil {
 			return rr, errors.Wrap(err, "run pitr")
 		}
@@ -232,7 +242,7 @@ func (r *ReconcilePerconaXtraDBClusterRestore) Reconcile(request reconcile.Reque
 		cluster.Spec.AllowUnsafeConfig = oldUnsafe
 	}
 
-	err = r.startCluster(&cluster)
+	err = r.startCluster(clusterOrig)
 	if err != nil {
 		err = errors.Wrap(err, "restart cluster")
 		return rr, err
@@ -245,22 +255,20 @@ func (r *ReconcilePerconaXtraDBClusterRestore) Reconcile(request reconcile.Reque
 
 func (r *ReconcilePerconaXtraDBClusterRestore) getBackup(cr *api.PerconaXtraDBClusterRestore) (*api.PerconaXtraDBClusterBackup, error) {
 	if cr.Spec.BackupSource != nil {
+		status := cr.Spec.BackupSource.DeepCopy()
+		status.State = api.BackupSucceeded
+		status.CompletedAt = nil
+		status.LastScheduled = nil
 		return &api.PerconaXtraDBClusterBackup{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:        cr.Name,
-				Namespace:   cr.Namespace,
-				ClusterName: cr.ClusterName,
+				Name:      cr.Name,
+				Namespace: cr.Namespace,
 			},
 			Spec: api.PXCBackupSpec{
 				PXCCluster:  cr.Spec.PXCCluster,
 				StorageName: cr.Spec.BackupSource.StorageName,
 			},
-			Status: api.PXCBackupStatus{
-				State:       api.BackupSucceeded,
-				Destination: cr.Spec.BackupSource.Destination,
-				StorageName: cr.Spec.BackupSource.StorageName,
-				S3:          cr.Spec.BackupSource.S3,
-			},
+			Status: *status,
 		}, nil
 	}
 
@@ -291,9 +299,9 @@ func (r *ReconcilePerconaXtraDBClusterRestore) stopCluster(c *api.PerconaXtraDBC
 		gracePeriodSec = int64(c.Spec.PXC.Size) * *c.Spec.PXC.TerminationGracePeriodSeconds
 	}
 
+	patch := client.MergeFrom(c.DeepCopy())
 	c.Spec.Pause = true
-
-	err := r.client.Update(context.TODO(), c)
+	err := r.client.Patch(context.TODO(), c, patch)
 	if err != nil {
 		return errors.Wrap(err, "shutdown pods")
 	}
@@ -341,25 +349,18 @@ func (r *ReconcilePerconaXtraDBClusterRestore) stopCluster(c *api.PerconaXtraDBC
 
 func (r *ReconcilePerconaXtraDBClusterRestore) startCluster(cr *api.PerconaXtraDBCluster) (err error) {
 	// tryin several times just to avoid possible conflicts with the main controller
-	for i := 0; i < 5; i++ {
+	err = k8sretry.RetryOnConflict(k8sretry.DefaultRetry, func() error {
 		// need to get the object with latest version of meta-data for update
 		current := &api.PerconaXtraDBCluster{}
-		err = r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace}, current)
-		if err != nil {
+		rerr := r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace}, current)
+		if rerr != nil {
 			return errors.Wrap(err, "get cluster")
 		}
-
 		current.Spec = cr.Spec
-
-		uerr := r.client.Update(context.TODO(), current)
-		if uerr == nil {
-			break
-		}
-		err = errors.Wrap(uerr, "update cluster")
-		time.Sleep(time.Second * 1)
-	}
+		return r.client.Update(context.TODO(), current)
+	})
 	if err != nil {
-		return err
+		return errors.Wrap(err, "update cluster")
 	}
 
 	// give time for process new state
@@ -451,12 +452,7 @@ func (r *ReconcilePerconaXtraDBClusterRestore) setStatus(cr *api.PerconaXtraDBCl
 
 	err := r.client.Status().Update(context.TODO(), cr)
 	if err != nil {
-		// may be it's k8s v1.10 and erlier (e.g. oc3.9) that doesn't support status updates
-		// so try to update whole CR
-		err := r.client.Update(context.TODO(), cr)
-		if err != nil {
-			return fmt.Errorf("send update: %v", err)
-		}
+		return errors.Wrap(err, "send update")
 	}
 
 	return nil

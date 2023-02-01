@@ -1,16 +1,16 @@
+// +kubebuilder:validation:Optional
+
 package v1
 
 import (
-	"encoding/json"
 	"fmt"
-	"log"
+	"os"
 	"strings"
 
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	"github.com/flosch/pongo2/v6"
 	"github.com/go-ini/ini"
 	"github.com/go-logr/logr"
-	cmmeta "github.com/jetstack/cert-manager/pkg/apis/meta/v1"
-	"github.com/percona/percona-xtradb-cluster-operator/version"
-
 	v "github.com/hashicorp/go-version"
 	"github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
@@ -18,6 +18,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"github.com/percona/percona-xtradb-cluster-operator/version"
 )
 
 // PerconaXtraDBClusterSpec defines the desired state of PerconaXtraDBCluster
@@ -33,7 +35,7 @@ type PerconaXtraDBClusterSpec struct {
 	TLS                       *TLSSpec                             `json:"tls,omitempty"`
 	PXC                       *PXCSpec                             `json:"pxc,omitempty"`
 	ProxySQL                  *PodSpec                             `json:"proxysql,omitempty"`
-	HAProxy                   *PodSpec                             `json:"haproxy,omitempty"`
+	HAProxy                   *HAProxySpec                         `json:"haproxy,omitempty"`
 	PMM                       *PMMSpec                             `json:"pmm,omitempty"`
 	LogCollector              *LogCollectorSpec                    `json:"logcollector,omitempty"`
 	Backup                    *PXCScheduledBackup                  `json:"backup,omitempty"`
@@ -42,13 +44,15 @@ type PerconaXtraDBClusterSpec struct {
 	AllowUnsafeConfig         bool                                 `json:"allowUnsafeConfigurations,omitempty"`
 	InitImage                 string                               `json:"initImage,omitempty"`
 	EnableCRValidationWebhook *bool                                `json:"enableCRValidationWebhook,omitempty"`
+	IgnoreAnnotations         []string                             `json:"ignoreAnnotations,omitempty"`
+	IgnoreLabels              []string                             `json:"ignoreLabels,omitempty"`
 }
 
 type PXCSpec struct {
 	AutoRecovery        *bool                `json:"autoRecovery,omitempty"`
 	ReplicationChannels []ReplicationChannel `json:"replicationChannels,omitempty"`
 	Expose              ServiceExpose        `json:"expose,omitempty"`
-	*PodSpec
+	*PodSpec            `json:",inline"`
 }
 
 type ServiceExpose struct {
@@ -60,9 +64,18 @@ type ServiceExpose struct {
 }
 
 type ReplicationChannel struct {
-	Name        string              `json:"name,omitempty"`
-	IsSource    bool                `json:"isSource,omitempty"`
-	SourcesList []ReplicationSource `json:"sourcesList,omitempty"`
+	Name        string                    `json:"name,omitempty"`
+	IsSource    bool                      `json:"isSource,omitempty"`
+	SourcesList []ReplicationSource       `json:"sourcesList,omitempty"`
+	Config      *ReplicationChannelConfig `json:"configuration,omitempty"`
+}
+
+type ReplicationChannelConfig struct {
+	SourceRetryCount   uint   `json:"sourceRetryCount,omitempty"`
+	SourceConnectRetry uint   `json:"sourceConnectRetry,omitempty"`
+	SSL                bool   `json:"ssl,omitempty"`
+	SSLSkipVerify      bool   `json:"sslSkipVerify,omitempty"`
+	CA                 string `json:"ca,omitempty"`
 }
 
 type ReplicationSource struct {
@@ -74,6 +87,20 @@ type ReplicationSource struct {
 type TLSSpec struct {
 	SANs       []string                `json:"SANs,omitempty"`
 	IssuerConf *cmmeta.ObjectReference `json:"issuerConf,omitempty"`
+}
+
+const (
+	UpgradeStrategyDisabled       = "disabled"
+	UpgradeStrategyNever          = "never"
+	DefaultVersionServiceEndpoint = "https://check.percona.com"
+)
+
+func GetDefaultVersionServiceEndpoint() string {
+	if endpoint := os.Getenv("PERCONA_VS_FALLBACK_URI"); len(endpoint) > 0 {
+		return endpoint
+	}
+
+	return DefaultVersionServiceEndpoint
 }
 
 type UpgradeOptions struct {
@@ -95,13 +122,14 @@ type PXCScheduledBackup struct {
 	ServiceAccountName string                        `json:"serviceAccountName,omitempty"`
 	Annotations        map[string]string             `json:"annotations,omitempty"`
 	PITR               PITRSpec                      `json:"pitr,omitempty"`
+	BackoffLimit       *int32                        `json:"backoffLimit,omitempty"`
 }
 
 type PITRSpec struct {
-	Enabled            bool          `json:"enabled"`
-	StorageName        string        `json:"storageName"`
-	Resources          *PodResources `json:"resources,omitempty"`
-	TimeBetweenUploads float64       `json:"timeBetweenUploads,omitempty"`
+	Enabled            bool                        `json:"enabled"`
+	StorageName        string                      `json:"storageName"`
+	Resources          corev1.ResourceRequirements `json:"resources,omitempty"`
+	TimeBetweenUploads float64                     `json:"timeBetweenUploads,omitempty"`
 }
 
 type PXCScheduledBackupSchedule struct {
@@ -124,6 +152,7 @@ const (
 // PerconaXtraDBClusterStatus defines the observed state of PerconaXtraDBCluster
 type PerconaXtraDBClusterStatus struct {
 	PXC                AppStatus          `json:"pxc,omitempty"`
+	PXCReplication     *ReplicationStatus `json:"pxcReplication,omitempty"`
 	ProxySQL           AppStatus          `json:"proxysql,omitempty"`
 	HAProxy            AppStatus          `json:"haproxy,omitempty"`
 	Backup             ComponentStatus    `json:"backup,omitempty"`
@@ -136,6 +165,16 @@ type PerconaXtraDBClusterStatus struct {
 	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
 	Size               int32              `json:"size"`
 	Ready              int32              `json:"ready"`
+}
+
+// TODO: add replication status(error,active and etc)
+type ReplicationStatus struct {
+	Channels []ReplicationChannelStatus `json:"replicationChannels,omitempty"`
+}
+
+type ReplicationChannelStatus struct {
+	Name                     string `json:"name,omitempty"`
+	ReplicationChannelConfig `json:",inline"`
 }
 
 type ConditionStatus string
@@ -163,7 +202,7 @@ type ComponentStatus struct {
 }
 
 type AppStatus struct {
-	ComponentStatus
+	ComponentStatus `json:",inline"`
 
 	Size  int32 `json:"size,omitempty"`
 	Ready int32 `json:"ready,omitempty"`
@@ -173,6 +212,16 @@ type AppStatus struct {
 
 // PerconaXtraDBCluster is the Schema for the perconaxtradbclusters API
 // +k8s:openapi-gen=true
+// +kubebuilder:subresource:status
+// +kubebuilder:subresource:scale:specpath=.spec.pxc.size,statuspath=.status.pxc.size,selectorpath=.status.pxc.labelSelectorPath
+// +kubebuilder:pruning:PreserveUnknownFields
+// +kubebuilder:resource:shortName="pxc";"pxcs"
+// +kubebuilder:printcolumn:name="Endpoint",type="string",JSONPath=".status.host"
+// +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.state"
+// +kubebuilder:printcolumn:name="PXC",type="string",JSONPath=".status.pxc.ready",description="Ready pxc nodes"
+// +kubebuilder:printcolumn:name="proxysql",type="string",JSONPath=".status.proxysql.ready",description="Ready proxysql nodes"
+// +kubebuilder:printcolumn:name="haproxy",type="string",JSONPath=".status.haproxy.ready",description="Ready haproxy nodes"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 type PerconaXtraDBCluster struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -184,6 +233,11 @@ type PerconaXtraDBCluster struct {
 func (cr *PerconaXtraDBCluster) Validate() error {
 	if len(cr.Name) > clusterNameMaxLen {
 		return errors.Errorf("cluster name (%s) too long, must be no more than %d characters", cr.Name, clusterNameMaxLen)
+	}
+
+	err := cr.validateVersion()
+	if err != nil {
+		return errors.Wrap(err, "invalid cr version")
 	}
 
 	c := cr.Spec
@@ -222,12 +276,9 @@ func (cr *PerconaXtraDBCluster) Validate() error {
 				return errors.Errorf("sources list for replication channel %s should be empty, because it's replica", channel.Name)
 			}
 
-			for _, src := range channel.SourcesList {
-				if src.Weight == 0 {
-					src.Weight = 100
-				}
-				if src.Port == 0 {
-					src.Port = 3306
+			if channel.Config != nil {
+				if channel.Config.SSL && channel.Config.CA == "" {
+					return errors.Errorf("if you set ssl for channel %s, you have to indicate a path to a CA file to verify the server certificate", channel.Name)
 				}
 			}
 		}
@@ -333,8 +384,8 @@ type PodSpec struct {
 	Enabled                       bool                                    `json:"enabled,omitempty"`
 	Size                          int32                                   `json:"size,omitempty"`
 	Image                         string                                  `json:"image,omitempty"`
-	Resources                     *PodResources                           `json:"resources,omitempty"`
-	SidecarResources              *PodResources                           `json:"sidecarResources,omitempty"`
+	Resources                     corev1.ResourceRequirements             `json:"resources,omitempty"`
+	SidecarResources              corev1.ResourceRequirements             `json:"sidecarResources,omitempty"`
 	VolumeSpec                    *VolumeSpec                             `json:"volumeSpec,omitempty"`
 	Affinity                      *PodAffinity                            `json:"affinity,omitempty"`
 	NodeSelector                  map[string]string                       `json:"nodeSelector,omitempty"`
@@ -358,6 +409,9 @@ type PodSpec struct {
 	LoadBalancerSourceRanges      []string                                `json:"loadBalancerSourceRanges,omitempty"`
 	LoadBalancerIP                string                                  `json:"loadBalancerIP,omitempty"`
 	ServiceAnnotations            map[string]string                       `json:"serviceAnnotations,omitempty"`
+	ServiceLabels                 map[string]string                       `json:"serviceLabels,omitempty"`
+	ReplicasServiceAnnotations    map[string]string                       `json:"replicasServiceAnnotations,omitempty"`
+	ReplicasServiceLabels         map[string]string                       `json:"replicasServiceLabels,omitempty"`
 	SchedulerName                 string                                  `json:"schedulerName,omitempty"`
 	ReadinessInitialDelaySeconds  *int32                                  `json:"readinessDelaySec,omitempty"`
 	ReadinessProbes               corev1.Probe                            `json:"readinessProbes,omitempty"`
@@ -368,7 +422,17 @@ type PodSpec struct {
 	ServiceAccountName            string                                  `json:"serviceAccountName,omitempty"`
 	ImagePullPolicy               corev1.PullPolicy                       `json:"imagePullPolicy,omitempty"`
 	Sidecars                      []corev1.Container                      `json:"sidecars,omitempty"`
+	SidecarVolumes                []corev1.Volume                         `json:"sidecarVolumes,omitempty"`
+	SidecarPVCs                   []corev1.PersistentVolumeClaim          `json:"sidecarPVCs,omitempty"`
 	RuntimeClassName              *string                                 `json:"runtimeClassName,omitempty"`
+	HookScript                    string                                  `json:"hookScript,omitempty"`
+}
+
+type HAProxySpec struct {
+	PodSpec                          `json:",inline"`
+	ReplicasServiceEnabled           *bool    `json:"replicasServiceEnabled,omitempty"`
+	ReplicasLoadBalancerSourceRanges []string `json:"replicasLoadBalancerSourceRanges,omitempty"`
+	ReplicasLoadBalancerIP           string   `json:"replicasLoadBalancerIP,omitempty"`
 }
 
 type PodDisruptionBudgetSpec struct {
@@ -381,55 +445,69 @@ type PodAffinity struct {
 	Advanced    *corev1.Affinity `json:"advanced,omitempty"`
 }
 
-type PodResources struct {
-	Requests *ResourcesList `json:"requests,omitempty"`
-	Limits   *ResourcesList `json:"limits,omitempty"`
-}
-
 type LogCollectorSpec struct {
-	Enabled                  bool                    `json:"enabled,omitempty"`
-	Image                    string                  `json:"image,omitempty"`
-	Resources                *PodResources           `json:"resources,omitempty"`
-	Configuration            string                  `json:"configuration,omitempty"`
-	ContainerSecurityContext *corev1.SecurityContext `json:"containerSecurityContext,omitempty"`
-	ImagePullPolicy          corev1.PullPolicy       `json:"imagePullPolicy,omitempty"`
-	RuntimeClassName         *string                 `json:"runtimeClassName,omitempty"`
+	Enabled                  bool                        `json:"enabled,omitempty"`
+	Image                    string                      `json:"image,omitempty"`
+	Resources                corev1.ResourceRequirements `json:"resources,omitempty"`
+	Configuration            string                      `json:"configuration,omitempty"`
+	ContainerSecurityContext *corev1.SecurityContext     `json:"containerSecurityContext,omitempty"`
+	ImagePullPolicy          corev1.PullPolicy           `json:"imagePullPolicy,omitempty"`
+	RuntimeClassName         *string                     `json:"runtimeClassName,omitempty"`
+	HookScript               string                      `json:"hookScript,omitempty"`
 }
 
 type PMMSpec struct {
-	Enabled                  bool                    `json:"enabled,omitempty"`
-	ServerHost               string                  `json:"serverHost,omitempty"`
-	Image                    string                  `json:"image,omitempty"`
-	ServerUser               string                  `json:"serverUser,omitempty"`
-	PxcParams                string                  `json:"pxcParams,omitempty"`
-	ProxysqlParams           string                  `json:"proxysqlParams,omitempty"`
-	Resources                *PodResources           `json:"resources,omitempty"`
-	ContainerSecurityContext *corev1.SecurityContext `json:"containerSecurityContext,omitempty"`
-	ImagePullPolicy          corev1.PullPolicy       `json:"imagePullPolicy,omitempty"`
-	RuntimeClassName         *string                 `json:"runtimeClassName,omitempty"`
+	Enabled                  bool                        `json:"enabled,omitempty"`
+	ServerHost               string                      `json:"serverHost,omitempty"`
+	Image                    string                      `json:"image,omitempty"`
+	ServerUser               string                      `json:"serverUser,omitempty"`
+	PxcParams                string                      `json:"pxcParams,omitempty"`
+	ProxysqlParams           string                      `json:"proxysqlParams,omitempty"`
+	Resources                corev1.ResourceRequirements `json:"resources,omitempty"`
+	ContainerSecurityContext *corev1.SecurityContext     `json:"containerSecurityContext,omitempty"`
+	ImagePullPolicy          corev1.PullPolicy           `json:"imagePullPolicy,omitempty"`
+	RuntimeClassName         *string                     `json:"runtimeClassName,omitempty"`
 }
 
-type ResourcesList struct {
-	Memory           string `json:"memory,omitempty"`
-	CPU              string `json:"cpu,omitempty"`
-	EphemeralStorage string `json:"ephemeral-storage,omitempty"`
+func (spec *PMMSpec) IsEnabled(secret *corev1.Secret) bool {
+	return spec.Enabled && spec.HasSecret(secret)
+}
+
+func (spec *PMMSpec) HasSecret(secret *corev1.Secret) bool {
+	for _, key := range []string{"pmmserver", "pmmserverkey"} {
+		if _, ok := secret.Data[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (spec *PMMSpec) UseAPI(secret *corev1.Secret) bool {
+	if _, ok := secret.Data["pmmserverkey"]; !ok {
+		if _, ok := secret.Data["pmmserver"]; ok {
+			return false
+		}
+	}
+	return true
 }
 
 type BackupStorageSpec struct {
-	Type                     BackupStorageType          `json:"type"`
-	S3                       BackupStorageS3Spec        `json:"s3,omitempty"`
-	Volume                   *VolumeSpec                `json:"volume,omitempty"`
-	NodeSelector             map[string]string          `json:"nodeSelector,omitempty"`
-	Resources                *PodResources              `json:"resources,omitempty"`
-	Affinity                 *corev1.Affinity           `json:"affinity,omitempty"`
-	Tolerations              []corev1.Toleration        `json:"tolerations,omitempty"`
-	Annotations              map[string]string          `json:"annotations,omitempty"`
-	Labels                   map[string]string          `json:"labels,omitempty"`
-	SchedulerName            string                     `json:"schedulerName,omitempty"`
-	PriorityClassName        string                     `json:"priorityClassName,omitempty"`
-	PodSecurityContext       *corev1.PodSecurityContext `json:"podSecurityContext,omitempty"`
-	ContainerSecurityContext *corev1.SecurityContext    `json:"containerSecurityContext,omitempty"`
-	RuntimeClassName         *string                    `json:"runtimeClassName,omitempty"`
+	Type                     BackupStorageType           `json:"type"`
+	S3                       *BackupStorageS3Spec        `json:"s3,omitempty"`
+	Azure                    *BackupStorageAzureSpec     `json:"azure,omitempty"`
+	Volume                   *VolumeSpec                 `json:"volume,omitempty"`
+	NodeSelector             map[string]string           `json:"nodeSelector,omitempty"`
+	Resources                corev1.ResourceRequirements `json:"resources,omitempty"`
+	Affinity                 *corev1.Affinity            `json:"affinity,omitempty"`
+	Tolerations              []corev1.Toleration         `json:"tolerations,omitempty"`
+	Annotations              map[string]string           `json:"annotations,omitempty"`
+	Labels                   map[string]string           `json:"labels,omitempty"`
+	SchedulerName            string                      `json:"schedulerName,omitempty"`
+	PriorityClassName        string                      `json:"priorityClassName,omitempty"`
+	PodSecurityContext       *corev1.PodSecurityContext  `json:"podSecurityContext,omitempty"`
+	ContainerSecurityContext *corev1.SecurityContext     `json:"containerSecurityContext,omitempty"`
+	RuntimeClassName         *string                     `json:"runtimeClassName,omitempty"`
+	VerifyTLS                *bool                       `json:"verifyTLS,omitempty"`
 }
 
 type BackupStorageType string
@@ -437,10 +515,11 @@ type BackupStorageType string
 const (
 	BackupStorageFilesystem BackupStorageType = "filesystem"
 	BackupStorageS3         BackupStorageType = "s3"
+	BackupStorageAzure      BackupStorageType = "azure"
 )
 
 const (
-	FinalizerDeleteS3Backup string = "delete-s3-backup"
+	FinalizerDeleteS3Backup string = "delete-s3-backup" // TODO: rename to a more appropriate name like `delete-backup`
 )
 
 type BackupStorageS3Spec struct {
@@ -448,6 +527,20 @@ type BackupStorageS3Spec struct {
 	CredentialsSecret string `json:"credentialsSecret"`
 	Region            string `json:"region,omitempty"`
 	EndpointURL       string `json:"endpointUrl,omitempty"`
+}
+
+type BackupStorageAzureSpec struct {
+	CredentialsSecret string `json:"credentialsSecret"`
+	ContainerPath     string `json:"container"`
+	Endpoint          string `json:"endpointUrl"`
+	StorageClass      string `json:"storageClass"`
+}
+
+// ContainerAndPrefix returns container name and backup prefix from ContainerPath.
+// BackupStorageAzureSpec.ContainerPath can contain backup path in format `<container-name>/<backup-prefix>`.
+func (b *BackupStorageAzureSpec) ContainerAndPrefix() (string, string) {
+	container, prefix, _ := strings.Cut(b.ContainerPath, "/")
+	return container, prefix
 }
 
 type VolumeSpec struct {
@@ -485,19 +578,22 @@ func ContainsVolume(vs []corev1.Volume, name string) bool {
 
 const WorkloadSA = "default"
 
+// +kubebuilder:object:generate=false
 type CustomVolumeGetter func(nsName, cvName, cmName string, useDefaultVolume bool) (corev1.Volume, error)
 
 var NoCustomVolumeErr = errors.New("no custom volume found")
 
+// +kubebuilder:object:generate=false
 type App interface {
 	AppContainer(spec *PodSpec, secrets string, cr *PerconaXtraDBCluster, availableVolumes []corev1.Volume) (corev1.Container, error)
 	SidecarContainers(spec *PodSpec, secrets string, cr *PerconaXtraDBCluster) ([]corev1.Container, error)
-	PMMContainer(spec *PMMSpec, secrets string, cr *PerconaXtraDBCluster) (*corev1.Container, error)
+	PMMContainer(spec *PMMSpec, secret *corev1.Secret, cr *PerconaXtraDBCluster) (*corev1.Container, error)
 	LogCollectorContainer(spec *LogCollectorSpec, logPsecrets string, logRsecrets string, cr *PerconaXtraDBCluster) ([]corev1.Container, error)
 	Volumes(podSpec *PodSpec, cr *PerconaXtraDBCluster, vg CustomVolumeGetter) (*Volume, error)
 	Labels() map[string]string
 }
 
+// +kubebuilder:object:generate=false
 type StatefulApp interface {
 	App
 	Name() string
@@ -544,23 +640,20 @@ func (cr *PerconaXtraDBCluster) ShouldWaitForTokenIssue() bool {
 // CheckNSetDefaults sets defaults options and overwrites wrong settings
 // and checks if other options' values are allowable
 // returned "changed" means CR should be updated on cluster
-func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerVersion, logger logr.Logger) (changed bool, err error) {
+func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerVersion, logger logr.Logger) (err error) {
+	err = cr.Validate()
+	if err != nil {
+		return errors.Wrap(err, "validate cr")
+	}
 	workloadSA := "percona-xtradb-cluster-operator-workload"
 	if cr.CompareVersionWith("1.6.0") >= 0 {
 		workloadSA = WorkloadSA
 	}
 
-	CRVerChanged := cr.setVersion()
-
-	err = cr.Validate()
-	if err != nil {
-		return false, errors.Wrap(err, "validate cr")
-	}
-
 	c := &cr.Spec
 
 	if c.PXC != nil {
-		changed = c.PXC.VolumeSpec.reconcileOpts()
+		c.PXC.VolumeSpec.reconcileOpts()
 
 		if len(c.PXC.ImagePullPolicy) == 0 {
 			c.PXC.ImagePullPolicy = corev1.PullAlways
@@ -569,6 +662,10 @@ func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerV
 		c.PXC.VaultSecretName = c.VaultSecretName
 		if len(c.PXC.VaultSecretName) == 0 {
 			c.PXC.VaultSecretName = cr.Name + "-vault"
+		}
+
+		if len(c.SecretsName) == 0 {
+			c.SecretsName = cr.Name + "-secrets"
 		}
 
 		if len(c.SSLSecretName) > 0 {
@@ -581,6 +678,23 @@ func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerV
 			c.PXC.SSLInternalSecretName = c.SSLInternalSecretName
 		} else {
 			c.PXC.SSLInternalSecretName = cr.Name + "-ssl-internal"
+		}
+
+		for chIdx, channel := range c.PXC.ReplicationChannels {
+			for srcIdx, src := range channel.SourcesList {
+				if src.Weight == 0 {
+					c.PXC.ReplicationChannels[chIdx].SourcesList[srcIdx].Weight = 100
+				}
+				if src.Port == 0 {
+					c.PXC.ReplicationChannels[chIdx].SourcesList[srcIdx].Port = 3306
+				}
+			}
+			if !channel.IsSource && channel.Config == nil {
+				c.PXC.ReplicationChannels[chIdx].Config = &ReplicationChannelConfig{
+					SourceRetryCount:   3,
+					SourceConnectRetry: 60,
+				}
+			}
 		}
 
 		setSafeDefaults(c, logger)
@@ -610,12 +724,18 @@ func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerV
 			c.PXC.Size = 0
 		}
 
-		if c.PMM != nil && c.PMM.Resources == nil {
-			c.PMM.Resources = c.PXC.Resources
+		if err = c.PXC.executeConfigurationTemplate(); err != nil {
+			return errors.Wrap(err, "pxc config")
 		}
 
-		if c.LogCollector != nil && c.LogCollector.Resources == nil {
-			c.LogCollector.Resources = c.PXC.Resources
+		if cr.CompareVersionWith("1.10.0") < 0 {
+			if c.PMM != nil && c.PMM.Resources.Size() == 0 {
+				c.PMM.Resources = c.PXC.Resources
+			}
+
+			if c.LogCollector != nil && c.LogCollector.Resources.Size() == 0 {
+				c.LogCollector.Resources = c.PXC.Resources
+			}
 		}
 
 		if len(c.LogCollectorSecretName) == 0 {
@@ -636,6 +756,11 @@ func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerV
 	}
 
 	if c.HAProxy != nil && c.HAProxy.Enabled {
+		if c.HAProxy.ReplicasServiceEnabled == nil {
+			t := true
+			c.HAProxy.ReplicasServiceEnabled = &t
+		}
+
 		if len(c.HAProxy.ImagePullPolicy) == 0 {
 			c.HAProxy.ImagePullPolicy = corev1.PullAlways
 		}
@@ -661,6 +786,10 @@ func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerV
 
 		c.HAProxy.reconcileAffinityOpts()
 
+		if err = c.HAProxy.executeConfigurationTemplate(); err != nil {
+			return errors.Wrap(err, "haproxy config")
+		}
+
 		if c.Pause {
 			c.HAProxy.Size = 0
 		}
@@ -671,7 +800,7 @@ func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerV
 			c.ProxySQL.ImagePullPolicy = corev1.PullAlways
 		}
 
-		changed = c.ProxySQL.VolumeSpec.reconcileOpts()
+		c.ProxySQL.VolumeSpec.reconcileOpts()
 
 		if len(c.SSLSecretName) > 0 {
 			c.ProxySQL.SSLSecretName = c.SSLSecretName
@@ -706,6 +835,10 @@ func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerV
 
 		c.ProxySQL.reconcileAffinityOpts()
 
+		if err = c.ProxySQL.executeConfigurationTemplate(); err != nil {
+			return errors.Wrap(err, "proxySQL config")
+		}
+
 		if c.Pause {
 			c.ProxySQL.Size = 0
 		}
@@ -728,7 +861,7 @@ func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerV
 			case BackupStorageS3:
 				// TODO what should we check here?
 			case BackupStorageFilesystem:
-				changed = strg.Volume.reconcileOpts()
+				strg.Volume.reconcileOpts()
 			}
 		}
 	}
@@ -749,7 +882,15 @@ func (cr *PerconaXtraDBCluster) CheckNSetDefaults(serverVersion *version.ServerV
 		cr.Spec.EnableCRValidationWebhook = &falseVal
 	}
 
-	return CRVerChanged || changed, nil
+	if cr.Spec.UpgradeOptions.Apply == "" {
+		cr.Spec.UpgradeOptions.Apply = UpgradeStrategyDisabled
+	}
+
+	if cr.Spec.UpgradeOptions.VersionServiceEndpoint == "" {
+		cr.Spec.UpgradeOptions.VersionServiceEndpoint = DefaultVersionServiceEndpoint
+	}
+
+	return nil
 }
 
 const (
@@ -758,7 +899,6 @@ const (
 )
 
 func (cr *PerconaXtraDBCluster) setProbesDefaults() {
-
 	if cr.Spec.PXC.LivenessInitialDelaySeconds != nil {
 		cr.Spec.PXC.LivenessProbes.InitialDelaySeconds = *cr.Spec.PXC.LivenessInitialDelaySeconds
 	} else if cr.Spec.PXC.LivenessProbes.InitialDelaySeconds == 0 {
@@ -861,28 +1001,12 @@ func setSafeDefaults(spec *PerconaXtraDBClusterSpec, log logr.Logger) {
 	}
 }
 
-// setVersion sets the API version of a PXC resource.
-// The new (semver-matching) version is determined either by the CR's API version or an API version specified via the CR's fields.
-// If the CR's API version is an empty string and last-applied-configuration from k8s is empty, it returns current operator version.
-func (cr *PerconaXtraDBCluster) setVersion() bool {
-	if len(cr.Spec.CRVersion) > 0 {
-		return false
+func (cr *PerconaXtraDBCluster) validateVersion() error {
+	if len(cr.Spec.CRVersion) == 0 {
+		return nil
 	}
-
-	apiVersion := version.Version
-
-	if lastCR, ok := cr.Annotations["kubectl.kubernetes.io/last-applied-configuration"]; ok {
-		var newCR PerconaXtraDBCluster
-		err := json.Unmarshal([]byte(lastCR), &newCR)
-		if err != nil {
-			log.Printf("failed to unmarshal cr: %v", err)
-		} else if len(newCR.APIVersion) > 0 {
-			apiVersion = strings.Replace(strings.TrimPrefix(newCR.APIVersion, "pxc.percona.com/v"), "-", ".", -1)
-		}
-	}
-
-	cr.Spec.CRVersion = apiVersion
-	return true
+	_, err := v.NewVersion(cr.Spec.CRVersion)
+	return err
 }
 
 func (cr *PerconaXtraDBCluster) Version() *v.Version {
@@ -892,10 +1016,6 @@ func (cr *PerconaXtraDBCluster) Version() *v.Version {
 // CompareVersionWith compares given version to current version.
 // Returns -1, 0, or 1 if given version is smaller, equal, or larger than the current version, respectively.
 func (cr *PerconaXtraDBCluster) CompareVersionWith(ver string) int {
-	if len(cr.Spec.CRVersion) == 0 {
-		_ = cr.setVersion()
-	}
-
 	return cr.Version().Compare(v.Must(v.NewVersion(ver)))
 }
 
@@ -922,6 +1042,8 @@ var affinityValidTopologyKeys = map[string]struct{}{
 	"kubernetes.io/hostname":                   {},
 	"failure-domain.beta.kubernetes.io/zone":   {},
 	"failure-domain.beta.kubernetes.io/region": {},
+	"topology.kubernetes.io/zone":              {},
+	"topology.kubernetes.io/region":            {},
 }
 
 var defaultAffinityTopologyKey = "kubernetes.io/hostname"
@@ -951,7 +1073,28 @@ func (p *PodSpec) reconcileAffinityOpts() {
 	}
 }
 
-func (v *VolumeSpec) reconcileOpts() (changed bool) {
+func (p *PodSpec) executeConfigurationTemplate() error {
+	if _, ok := p.Resources.Limits[corev1.ResourceMemory]; !ok {
+		if strings.Contains(p.Configuration, "{{") {
+			return errors.New("resources.limits[memory] should be specified for template usage in configuration")
+		}
+		return nil
+	}
+
+	tmpl, err := pongo2.FromString(p.Configuration)
+	if err != nil {
+		return errors.Wrap(err, "parse template")
+	}
+
+	memory := p.Resources.Limits.Memory()
+	p.Configuration, err = tmpl.Execute(pongo2.Context{"containerMemoryLimit": memory.Value()})
+	if err != nil {
+		return errors.Wrap(err, "execute template")
+	}
+	return nil
+}
+
+func (v *VolumeSpec) reconcileOpts() {
 	if v.EmptyDir == nil && v.HostPath == nil && v.PersistentVolumeClaim == nil {
 		v.PersistentVolumeClaim = &corev1.PersistentVolumeClaimSpec{}
 	}
@@ -959,11 +1102,8 @@ func (v *VolumeSpec) reconcileOpts() (changed bool) {
 	if v.PersistentVolumeClaim != nil {
 		if len(v.PersistentVolumeClaim.AccessModes) == 0 {
 			v.PersistentVolumeClaim.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
-			changed = true
 		}
 	}
-
-	return changed
 }
 
 func (v *VolumeSpec) validate() error {
@@ -993,6 +1133,50 @@ func AddSidecarContainers(logger logr.Logger, existing, sidecars []corev1.Contai
 	for _, c := range sidecars {
 		if _, ok := names[c.Name]; ok {
 			logger.Info(fmt.Sprintf("Sidecar container name cannot be %s. It's skipped", c.Name))
+			continue
+		}
+
+		existing = append(existing, c)
+	}
+
+	return existing
+}
+
+func AddSidecarVolumes(logger logr.Logger, existing, sidecarVolumes []corev1.Volume) []corev1.Volume {
+	if len(sidecarVolumes) == 0 {
+		return existing
+	}
+
+	names := make(map[string]struct{}, len(existing))
+	for _, c := range existing {
+		names[c.Name] = struct{}{}
+	}
+
+	for _, c := range sidecarVolumes {
+		if _, ok := names[c.Name]; ok {
+			logger.Info(fmt.Sprintf("Sidecar volume name cannot be %s. It's skipped", c.Name))
+			continue
+		}
+
+		existing = append(existing, c)
+	}
+
+	return existing
+}
+
+func AddSidecarPVCs(logger logr.Logger, existing, sidecarPVCs []corev1.PersistentVolumeClaim) []corev1.PersistentVolumeClaim {
+	if len(sidecarPVCs) == 0 {
+		return existing
+	}
+
+	names := make(map[string]struct{}, len(existing))
+	for _, c := range existing {
+		names[c.Name] = struct{}{}
+	}
+
+	for _, c := range sidecarPVCs {
+		if _, ok := names[c.Name]; ok {
+			logger.Info(fmt.Sprintf("Sidecar PVC name cannot be %s. It's skipped", c.Name))
 			continue
 		}
 
@@ -1032,6 +1216,10 @@ func (cr *PerconaXtraDBCluster) HAProxyReplicasNamespacedName() types.Namespaced
 
 func (cr *PerconaXtraDBCluster) HAProxyEnabled() bool {
 	return cr.Spec.HAProxy != nil && cr.Spec.HAProxy.Enabled
+}
+
+func (cr *PerconaXtraDBCluster) HAProxyReplicasServiceEnabled() bool {
+	return *cr.Spec.HAProxy.ReplicasServiceEnabled
 }
 
 func (cr *PerconaXtraDBCluster) ProxySQLEnabled() bool {
@@ -1088,4 +1276,8 @@ func (cr *PerconaXtraDBCluster) CanBackup() error {
 	}
 
 	return nil
+}
+
+func (cr *PerconaXtraDBCluster) PITREnabled() bool {
+	return cr.Spec.Backup != nil && cr.Spec.Backup.PITR.Enabled
 }

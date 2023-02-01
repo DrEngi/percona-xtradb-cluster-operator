@@ -9,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	k8sretry "k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "github.com/percona/percona-xtradb-cluster-operator/pkg/apis/pxc/v1"
@@ -16,7 +17,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-func (r *ReconcilePerconaXtraDBCluster) updateStatus(cr *api.PerconaXtraDBCluster, reconcileErr error) (err error) {
+func (r *ReconcilePerconaXtraDBCluster) updateStatus(cr *api.PerconaXtraDBCluster, inProgress bool, reconcileErr error) (err error) {
 	clusterCondition := api.ClusterCondition{
 		Status:             api.ConditionTrue,
 		Type:               api.AppStateInit,
@@ -60,16 +61,24 @@ func (r *ReconcilePerconaXtraDBCluster) updateStatus(cr *api.PerconaXtraDBCluste
 		},
 	}
 
-	cr.Status.HAProxy = api.AppStatus{}
+	cr.Status.HAProxy = api.AppStatus{
+		ComponentStatus: api.ComponentStatus{
+			Version: cr.Status.HAProxy.Version,
+		},
+	}
 	if cr.HAProxyEnabled() {
 		apps = append(apps, sfsstatus{
 			app:    statefulset.NewHAProxy(cr),
 			status: &cr.Status.HAProxy,
-			spec:   cr.Spec.HAProxy,
+			spec:   &cr.Spec.HAProxy.PodSpec,
 		})
 	}
 
-	cr.Status.ProxySQL = api.AppStatus{}
+	cr.Status.ProxySQL = api.AppStatus{
+		ComponentStatus: api.ComponentStatus{
+			Version: cr.Status.ProxySQL.Version,
+		},
+	}
 	if cr.ProxySQLEnabled() {
 		apps = append(apps, sfsstatus{
 			app:    statefulset.NewProxy(cr),
@@ -78,7 +87,6 @@ func (r *ReconcilePerconaXtraDBCluster) updateStatus(cr *api.PerconaXtraDBCluste
 		})
 	}
 
-	inProgress := false
 	cr.Status.Size = 0
 	cr.Status.Ready = 0
 	for _, a := range apps {
@@ -124,17 +132,20 @@ func (r *ReconcilePerconaXtraDBCluster) updateStatus(cr *api.PerconaXtraDBCluste
 }
 
 func (r *ReconcilePerconaXtraDBCluster) writeStatus(cr *api.PerconaXtraDBCluster) error {
-	err := r.client.Status().Update(context.TODO(), cr)
-	if err != nil {
-		// may be it's k8s v1.10 and erlier (e.g. oc3.9) that doesn't support status updates
-		// so try to update whole CR
-		err := r.client.Update(context.TODO(), cr)
-		if err != nil {
-			return errors.Wrap(err, "send update")
-		}
-	}
+	err := k8sretry.RetryOnConflict(k8sretry.DefaultRetry, func() error {
+		c := &api.PerconaXtraDBCluster{}
 
-	return nil
+		err := r.client.Get(context.TODO(), types.NamespacedName{Name: cr.Name, Namespace: cr.Namespace}, c)
+		if err != nil {
+			return err
+		}
+
+		c.Status = cr.Status
+
+		return r.client.Status().Update(context.TODO(), c)
+	})
+
+	return errors.Wrap(err, "write status")
 }
 
 func (r *ReconcilePerconaXtraDBCluster) upgradeInProgress(cr *api.PerconaXtraDBCluster, appName string) (bool, error) {
